@@ -25,7 +25,6 @@ use std::time::Duration;
 
 pub use qmsg_types::{self as types, Command, LogLevel, Message, ProviderConfig};
 use qmsg_types::{HostMessage, ProviderMessage};
-use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{WebSocket, protocol::Message as Frame};
 
 #[doc(hidden)]
@@ -50,14 +49,20 @@ pub trait Provider {
 /// The provider's connection to the orchestrator.
 pub struct Context {
     config: ProviderConfig,
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    socket: WebSocket<TcpStream>,
     /// Commands that arrived while waiting for something else.
     pending: VecDeque<Command>,
 }
 
 impl Context {
     fn connect(config: ProviderConfig) -> Result<Self> {
-        let (socket, _) = tungstenite::connect(&config.host_url)?;
+        let addr = config
+            .host_url
+            .strip_prefix("ws://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or_else(|| format!("invalid host url `{}`", config.host_url))?;
+        let (socket, _) = tungstenite::client(&config.host_url, TcpStream::connect(addr)?)
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             config,
             socket,
@@ -143,10 +148,7 @@ impl Context {
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result {
-        if let MaybeTlsStream::Plain(stream) = self.socket.get_mut() {
-            stream.set_read_timeout(timeout)?;
-        }
-        Ok(())
+        Ok(self.socket.get_mut().set_read_timeout(timeout)?)
     }
 }
 

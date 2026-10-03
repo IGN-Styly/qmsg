@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     drop(events_tx);
 
     let mut running = handles.len();
+    let mut shutting_down = false;
     while running > 0 {
         tokio::select! {
             Some(event) = events.recv() => match event {
@@ -55,7 +56,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
+                if shutting_down {
+                    // Killed providers send no `Exited`, so stop waiting.
+                    tracing::warn!("killing providers");
+                    for handle in &handles {
+                        handle.kill();
+                    }
+                    break;
+                }
+                tracing::info!("shutting down, press Ctrl-C again to kill");
+                shutting_down = true;
                 for handle in &handles {
                     let _ = handle.send(Command::Shutdown);
                 }
