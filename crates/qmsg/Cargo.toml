@@ -1,0 +1,6 @@
+[package]
+name = "qmsg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

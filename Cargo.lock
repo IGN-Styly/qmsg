@@ -5,3 +5,11 @@ version = 4
 [[package]]
 name = "qmsg"
 version = "0.1.0"
+
+[[package]]
+name = "qmsg-orchestrator"
+version = "0.1.0"
+
+[[package]]
+name = "qmsg-sdk"
+version = "0.1.0"
