@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+qmsg-types.workspace = true
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+wit-bindgen = "0.62"

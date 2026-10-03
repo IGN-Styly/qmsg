@@ -1,8 +1,20 @@
 [workspace]
-members = ["crates/qmsg", "crates/qmsg-orchestrator", "crates/qmsg-sdk"]
-default-members = ["crates/qmsg"]
+members = [
+    "crates/qmsg",
+    "crates/qmsg-orchestrator",
+    "crates/qmsg-sdk",
+    "crates/qmsg-types",
+    "providers/echo",
+]
+default-members = ["crates/qmsg", "crates/qmsg-orchestrator", "crates/qmsg-sdk", "crates/qmsg-types"]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[workspace.dependencies]
+qmsg-sdk = { path = "crates/qmsg-sdk" }
+qmsg-types = { path = "crates/qmsg-types" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }

@@ -1,0 +1,13 @@
+// The boundary between the orchestrator and a provider.
+//
+// Everything else happens over a WebSocket: the config passed to `run` holds
+// the URL to connect to, and the messages are the Rust types in `qmsg-types`.
+package qmsg:abi@1.0.0;
+
+world provider {
+  /// Must return `qmsg_types::ABI_VERSION` the provider was built with.
+  export abi-version: func() -> u32;
+
+  /// Postcard `ProviderConfig` in. Runs the provider until it exits.
+  export run: func(config: list<u8>) -> result<_, string>;
+}

@@ -1,0 +1,11 @@
+[package]
+name = "qmsg-provider-echo"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+qmsg-sdk.workspace = true

@@ -1,0 +1,8 @@
+# Copy to orchestrator.toml and run `cargo run -p qmsg-orchestrator`.
+
+[[provider]]
+name = "echo"
+wasm = "target/wasm32-wasip2/debug/qmsg_provider_echo.wasm"
+
+[provider.settings]
+server = "127.0.0.1:7000"
