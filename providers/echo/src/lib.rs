@@ -26,6 +26,11 @@ impl Provider for Echo {
 
         while let Some(command) = cx.next_command(None)? {
             match command {
+                // The protocol is one line per message, so a line break
+                // would make the replies fall out of step with the commands.
+                Command::Send { body, .. } if body.contains(['\n', '\r']) => {
+                    cx.log(LogLevel::Warn, "skipping a message with a line break");
+                }
                 Command::Send { chat, body } => {
                     writeln!(conn.get_mut(), "{body}")?;
                     let reply = read_line(&mut conn)?;

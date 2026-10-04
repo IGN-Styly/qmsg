@@ -41,6 +41,12 @@ mod bindings {
 /// How often running providers are made to yield to the executor.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// Total key and value bytes a provider may keep in KV storage. It lives in
+/// the orchestrator's memory, outside the provider's `MEMORY_LIMIT`.
+const KV_LIMIT: usize = 16 * 1024 * 1024;
+/// Replies waiting to be written to a provider. A provider that keeps asking
+/// without reading only stalls its own connection.
+const REPLY_QUEUE: usize = 64;
 
 /// A provider to run.
 #[derive(Debug, Clone, Deserialize)]
@@ -70,8 +76,8 @@ type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 struct Session {
     name: String,
     commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>,
-    events: mpsc::UnboundedSender<ProviderEvent>,
-    kv: Mutex<HashMap<String, Vec<u8>>>,
+    events: mpsc::Sender<ProviderEvent>,
+    kv: Mutex<Kv>,
     /// Open connections, counted from the handshake until every frame the
     /// provider sent has been handled.
     connections: watch::Sender<usize>,
@@ -86,6 +92,13 @@ impl Session {
         let mut connections = self.connections.subscribe();
         let _ = connections.wait_for(|&n| n == 0).await;
     }
+}
+
+#[derive(Default)]
+struct Kv {
+    values: HashMap<String, Vec<u8>>,
+    /// Key and value bytes stored, checked against `KV_LIMIT`.
+    bytes: usize,
 }
 
 /// Counts one connection for as long as it is alive.
@@ -155,11 +168,13 @@ impl Orchestrator {
     /// Starts a provider on its own thread.
     ///
     /// Events from the provider, including its exit, are sent to `events`.
+    /// When `events` is full the provider's messages wait, which in turn
+    /// slows the provider down.
     /// Failing to load the Wasm is reported as an `Exited` event.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
-        events: mpsc::UnboundedSender<ProviderEvent>,
+        events: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<ProviderHandle> {
         let token = new_token()?;
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -209,7 +224,9 @@ impl Orchestrator {
                 };
                 sessions.lock().unwrap().remove(&token);
                 if let Some(result) = result {
-                    let _ = events.send(ProviderEvent::Exited {
+                    // Outside the runtime now, so a full channel just blocks
+                    // this thread.
+                    let _ = events.blocking_send(ProviderEvent::Exited {
                         provider: name,
                         result: result.map_err(|e| format!("{e:#}")),
                     });
@@ -379,17 +396,24 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
     // Reading and writing run independently, so a provider that is busy
     // writing a large message can't deadlock against a large command.
     let (mut sink, mut stream) = socket.split();
-    let (replies_tx, mut replies) = mpsc::unbounded_channel();
+    let (replies_tx, mut replies) = mpsc::channel(REPLY_QUEUE);
 
     let reader = async move {
         while let Some(frame) = stream.next().await {
             match frame {
                 Ok(Frame::Binary(bytes)) => match qmsg_types::decode(&bytes) {
-                    Ok(message) => {
-                        if let Some(reply) = session.handle(message) {
-                            let _ = replies_tx.send(reply);
+                    Ok(message) => match session.handle(message).await {
+                        Ok(Some(reply)) => {
+                            if replies_tx.send(reply).await.is_err() {
+                                break;
+                            }
                         }
-                    }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(provider = session.name, "closing connection: {e}");
+                            break;
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(provider = session.name, "invalid message: {e}");
                         break;
@@ -437,7 +461,9 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
 
 impl Session {
     /// Handles a message from the provider, returning the reply if it needs one.
-    fn handle(&self, message: ProviderMessage) -> Option<HostMessage> {
+    ///
+    /// An error means the provider misbehaved and its connection is closed.
+    async fn handle(&self, message: ProviderMessage) -> Result<Option<HostMessage>, String> {
         match message {
             ProviderMessage::Log { level, message } => {
                 let provider = &self.name;
@@ -448,22 +474,32 @@ impl Session {
                     LogLevel::Debug => tracing::debug!(provider, "{message}"),
                     LogLevel::Trace => tracing::trace!(provider, "{message}"),
                 }
-                None
+                Ok(None)
             }
             ProviderMessage::Emit(message) => {
-                let _ = self.events.send(ProviderEvent::Message {
-                    provider: self.name.clone(),
-                    message,
-                });
-                None
+                let _ = self
+                    .events
+                    .send(ProviderEvent::Message {
+                        provider: self.name.clone(),
+                        message,
+                    })
+                    .await;
+                Ok(None)
             }
             ProviderMessage::KvGet { key } => {
-                let value = self.kv.lock().unwrap().get(&key).cloned();
-                Some(HostMessage::Value { key, value })
+                let value = self.kv.lock().unwrap().values.get(&key).cloned();
+                Ok(Some(HostMessage::Value { key, value }))
             }
             ProviderMessage::KvSet { key, value } => {
-                self.kv.lock().unwrap().insert(key, value);
-                None
+                let mut kv = self.kv.lock().unwrap();
+                let old = kv.values.get(&key).map_or(0, |v| key.len() + v.len());
+                let bytes = kv.bytes - old + key.len() + value.len();
+                if bytes > KV_LIMIT {
+                    return Err(format!("KV storage over its {KV_LIMIT} byte limit"));
+                }
+                kv.bytes = bytes;
+                kv.values.insert(key, value);
+                Ok(None)
             }
         }
     }

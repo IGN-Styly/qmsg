@@ -28,7 +28,10 @@ fn echo_wasm() -> &'static PathBuf {
             .status()
             .expect("failed to run cargo");
         assert!(status.success(), "building the echo provider failed");
-        root.join("target/wasm32-wasip2/debug/qmsg_provider_echo.wasm")
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| root.join(dir))
+            .unwrap_or_else(|| root.join("target"));
+        target.join("wasm32-wasip2/debug/qmsg_provider_echo.wasm")
     })
 }
 
@@ -62,7 +65,7 @@ fn spec(port: u16) -> ProviderSpec {
     }
 }
 
-async fn next(events: &mut mpsc::UnboundedReceiver<ProviderEvent>) -> ProviderEvent {
+async fn next(events: &mut mpsc::Receiver<ProviderEvent>) -> ProviderEvent {
     timeout(Duration::from_secs(30), events.recv())
         .await
         .expect("timed out waiting for provider event")
@@ -73,7 +76,7 @@ async fn next(events: &mut mpsc::UnboundedReceiver<ProviderEvent>) -> ProviderEv
 async fn provider_owns_its_connection() {
     let port = start_server().await;
     let orchestrator = Orchestrator::new().await.unwrap();
-    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
 
     let message = match next(&mut events).await {
@@ -122,7 +125,7 @@ async fn provider_owns_its_connection() {
 async fn kill_stops_a_blocked_provider() {
     let port = start_server().await;
     let orchestrator = Orchestrator::new().await.unwrap();
-    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     next(&mut events).await; // greeting; the provider now waits for commands
 
@@ -138,7 +141,7 @@ async fn kill_stops_a_blocked_provider() {
 async fn dropping_the_handle_stops_the_provider() {
     let port = start_server().await;
     let orchestrator = Orchestrator::new().await.unwrap();
-    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     next(&mut events).await; // greeting; the provider now waits for commands
 

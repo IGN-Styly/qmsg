@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     let orchestrator = Orchestrator::new().await?;
-    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let (events_tx, mut events) = mpsc::channel(256);
     let mut handles = Vec::new();
     for spec in config.providers {
         handles.push(orchestrator.spawn(spec, events_tx.clone())?);

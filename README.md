@@ -20,10 +20,18 @@ provider owns its network connections and has full TCP and UDP access.
 Each provider runs on its own thread and talks to the orchestrator over a
 WebSocket on localhost, sending postcard-encoded `qmsg-types` messages.
 `wit/qmsg.wit` only exports the entry point and should not need to change.
-Change the types instead, appending new enum variants at the end, and bump
-`ABI_VERSION` for breaking changes.
+Change the types instead. New enum variants go at the end; any other change,
+including adding a field, needs an `ABI_VERSION` bump, because postcard can't
+decode a layout it doesn't know.
 
-Build the example provider and run it:
+The example provider connects to a line-based TCP server, so start one first.
+Type a line into it to send the provider its greeting:
+
+```sh
+nc -lk 127.0.0.1 7000
+```
+
+Then build the provider and run the orchestrator:
 
 ```sh
 rustup target add wasm32-wasip2

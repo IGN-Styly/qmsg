@@ -3,9 +3,11 @@
 //! Providers talk to the orchestrator over a WebSocket. Each binary frame holds
 //! one postcard-encoded [`ProviderMessage`] or [`HostMessage`].
 //!
-//! These are encoded with postcard, which is not self-describing. Only append
-//! new enum variants and fields at the end, and bump [`ABI_VERSION`] for any
-//! change that breaks existing providers.
+//! These are encoded with postcard, which is not self-describing, so both
+//! sides must agree on the exact layout. Adding an enum variant at the end is
+//! compatible as long as it is only sent to code that knows it. Any other
+//! change, including adding a field, breaks existing providers and needs an
+//! [`ABI_VERSION`] bump.
 
 use std::collections::BTreeMap;
 
