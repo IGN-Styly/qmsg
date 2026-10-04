@@ -62,12 +62,8 @@ impl Secrets {
             // secrets as plain text, and a new key would orphan the old ones.
             // The lock means no one else can add encrypted rows meanwhile.
             let encrypted = secrets.has_encrypted()?;
-            let key = dir
-                .to_str()
-                // Lossy conversion could give two directories the same key.
-                .with_context(|| format!("{} is not valid UTF-8", dir.display()))
-                .and_then(|user| master_key(&*keychain()?, user, !encrypted));
-            match key {
+            let user = keychain_user(&dir);
+            match keychain().and_then(|store| master_key(&*store, &user, !encrypted)) {
                 Ok(key) => secrets.cipher = Some(XChaCha20Poly1305::new(&key)),
                 Err(e) if encrypted => {
                     return Err(e.context("can't load the master key for the stored secrets"));
@@ -205,6 +201,20 @@ impl Secrets {
 /// provider.
 fn aad(provider: &str, key: &str) -> Vec<u8> {
     qmsg_types::encode(&(provider, key)).expect("strings always encode")
+}
+
+/// Names a data directory's master key. A lossy path conversion could give two
+/// directories the same key, so paths that aren't UTF-8 are hex-encoded. A
+/// canonical path is absolute, so it never starts with `hex:` itself.
+fn keychain_user(dir: &Path) -> String {
+    match dir.to_str() {
+        Some(path) => path.to_owned(),
+        None => {
+            let bytes = dir.as_os_str().as_encoded_bytes();
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            format!("hex:{hex}")
+        }
+    }
 }
 
 /// Loads the master key from the keychain, creating it if `create` is set.
@@ -429,6 +439,16 @@ mod tests {
         assert_eq!(master_key(&*store, "/a", true).unwrap(), key);
         // Each data directory has its own key.
         assert_ne!(master_key(&*store, "/b", true).unwrap(), key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directories_have_distinct_keys() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = keychain_user(Path::new(std::ffi::OsStr::from_bytes(b"/data-\xff")));
+        let b = keychain_user(Path::new(std::ffi::OsStr::from_bytes(b"/data-\xfe")));
+        assert_ne!(a, b);
+        assert_eq!(keychain_user(Path::new("/data")), "/data");
     }
 
     #[test]
