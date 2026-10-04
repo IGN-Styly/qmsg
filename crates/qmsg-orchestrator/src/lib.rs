@@ -7,7 +7,7 @@
 //! Providers talk to the orchestrator over a WebSocket. The orchestrator serves
 //! it on localhost and gives each provider a URL with its own session token.
 //!
-//! Providers report the organizations and channels they are part of as
+//! Providers report the organizations, users and channels they are part of as
 //! [`ProviderEvent::Directory`]; [`Directory`] keeps track of them.
 //!
 //! Providers' secrets live in a SQLite database in the data directory; see
@@ -23,16 +23,18 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use futures_util::{SinkExt, StreamExt};
 use qmsg_types::{
-    ABI_VERSION, Command, DirectoryUpdate, HostMessage, LogLevel, Message, ProviderConfig,
-    ProviderMessage,
+    ABI_VERSION, Command, DirectoryUpdate, HostMessage, LogLevel, MAX_FRAME, MessageEvent,
+    ProviderConfig, ProviderMessage,
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -40,7 +42,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 mod directory;
 mod secrets;
 
-pub use directory::Directory;
+pub use directory::{ApplyError, Directory, OrganizationEntry, Scope};
 pub use secrets::Encryption;
 use secrets::Secrets;
 
@@ -67,16 +69,25 @@ pub struct ProviderSpec {
     pub settings: BTreeMap<String, String>,
 }
 
+/// Something a provider did. `Exited` is always a provider's last event, and
+/// its name can't be used by another provider until `Exited` is delivered.
 #[derive(Debug)]
 pub enum ProviderEvent {
     Message {
         provider: String,
-        message: Message,
+        event: MessageEvent,
     },
-    /// A change to the organizations and channels the provider is part of.
+    /// A change to the organizations, users and channels the provider is part
+    /// of.
     Directory {
         provider: String,
         update: DirectoryUpdate,
+    },
+    /// The answer to a [`Command::Send`].
+    Sent {
+        provider: String,
+        request: u64,
+        result: Result<String, String>,
     },
     Exited {
         provider: String,
@@ -90,7 +101,8 @@ type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 /// The orchestrator's side of one provider's WebSocket.
 struct Session {
     name: String,
-    commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>,
+    /// Encoded `HostMessage::Command`s.
+    commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     events: mpsc::Sender<ProviderEvent>,
     /// Weak, so dropping the orchestrator releases the data directory even
     /// while providers are still running.
@@ -190,6 +202,9 @@ impl Orchestrator {
     /// When `events` is full the provider's messages wait, which in turn
     /// slows the provider down.
     /// Failing to load the Wasm is reported as an `Exited` event.
+    ///
+    /// Fails if a provider with the same name hasn't delivered its `Exited`
+    /// yet.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
@@ -225,34 +240,40 @@ impl Orchestrator {
         let spawned = thread::Builder::new()
             .name(format!("provider-{}", spec.name))
             .spawn(move || {
-                let result = match tokio::runtime::Builder::new_current_thread()
+                let exited = |result: anyhow::Result<()>| ProviderEvent::Exited {
+                    provider: name,
+                    result: result.map_err(|e| format!("{e:#}")),
+                };
+                match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async {
-                        let finished = async {
-                            let result = run(engine, &linker, spec, host_url).await;
-                            // The provider's socket closed when its store was
-                            // dropped; handle what it sent before reporting
-                            // the exit, so `Exited` is always its last event.
-                            session.drained().await;
-                            result
+                        // Losing the race drops the provider's store, which
+                        // closes its sockets.
+                        let result = tokio::select! {
+                            result = run(engine, &linker, spec, host_url) => result,
+                            () = killed.notified() => Err(anyhow::anyhow!("killed")),
                         };
-                        tokio::select! {
-                            result = finished => Some(result),
-                            () = killed.notified() => None,
+                        // Handle what the provider sent before reporting the
+                        // exit, so `Exited` is always its last event.
+                        session.drained().await;
+                        let permit = events.reserve().await;
+                        // Freeing the name and sending `Exited` together means
+                        // a new provider with this name can't send events
+                        // first, and can be spawned as soon as `Exited` is
+                        // received.
+                        let mut sessions = sessions.lock().unwrap();
+                        sessions.remove(&token);
+                        if let Ok(permit) = permit {
+                            permit.send(exited(result));
                         }
                     }),
-                    Err(e) => Some(Err(e.into())),
-                };
-                sessions.lock().unwrap().remove(&token);
-                if let Some(result) = result {
-                    // Outside the runtime now, so a full channel just blocks
-                    // this thread.
-                    let _ = events.blocking_send(ProviderEvent::Exited {
-                        provider: name,
-                        result: result.map_err(|e| format!("{e:#}")),
-                    });
+                    Err(e) => {
+                        // The provider never ran, so it sent no other events.
+                        sessions.lock().unwrap().remove(&token);
+                        let _ = events.blocking_send(exited(Err(e.into())));
+                    }
                 }
             });
         if let Err(e) = spawned {
@@ -270,21 +291,29 @@ impl Orchestrator {
 
 /// Controls a running provider. Dropping it kills the provider.
 pub struct ProviderHandle {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::UnboundedSender<Vec<u8>>,
     kill: Arc<Notify>,
 }
 
 impl ProviderHandle {
-    /// Queues a command. Fails if the provider has already exited.
+    /// Queues a command. Fails if the provider has already exited, or if the
+    /// command is too big to send.
     pub fn send(&self, command: Command) -> anyhow::Result<()> {
+        let bytes = qmsg_types::encode(&HostMessage::Command(command))?;
+        if bytes.len() > MAX_FRAME {
+            bail!(
+                "command is {} bytes, over the {MAX_FRAME} byte limit",
+                bytes.len()
+            );
+        }
         self.commands
-            .send(command)
+            .send(bytes)
             .map_err(|_| anyhow::anyhow!("provider is not running"))
     }
 
     /// Stops the provider immediately, even if it is blocked on I/O.
     ///
-    /// No `Exited` event is sent for a killed provider.
+    /// Its `Exited` event fails with `killed`.
     pub fn kill(&self) {
         self.kill.notify_one();
     }
@@ -384,7 +413,10 @@ async fn serve(listener: TcpListener, sessions: Sessions) {
 #[allow(clippy::result_large_err)]
 async fn connection(stream: TcpStream, sessions: Sessions) {
     let mut guard = None;
-    let accept = tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response| {
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
+    let callback = |request: &Request, response| {
         let token = request.uri().path().trim_start_matches('/');
         // Counted before the handshake completes, so the provider can't
         // finish and be reported as exited before this connection counts.
@@ -398,7 +430,8 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
             Some(_) => Ok(response),
             None => Err(not_found()),
         }
-    });
+    };
+    let accept = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(limits));
     let socket = match accept.await {
         Ok(socket) => socket,
         Err(e) => {
@@ -432,6 +465,11 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
                 },
                 Ok(Frame::Close(_)) => break,
                 Ok(_) => {}
+                // The SDK refuses to send these, so the provider bypassed it.
+                Err(e @ WsError::Capacity(_)) => {
+                    tracing::warn!(provider = session.name, "connection error: {e}");
+                    break;
+                }
                 Err(e) => {
                     tracing::debug!(provider = session.name, "connection error: {e}");
                     break;
@@ -447,20 +485,20 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
         let mut commands = session.commands.lock().await;
         let mut commands_open = true;
         loop {
-            let message = tokio::select! {
+            let bytes = tokio::select! {
                 command = commands.recv(), if commands_open => match command {
-                    Some(command) => HostMessage::Command(command),
+                    Some(bytes) => bytes,
                     None => {
                         commands_open = false;
                         continue;
                     }
                 },
+                // Replies are small: secrets are limited far below `MAX_FRAME`.
                 reply = replies.recv() => match reply {
-                    Some(reply) => reply,
+                    Some(reply) => qmsg_types::encode(&reply).expect("host messages always encode"),
                     None => break,
                 },
             };
-            let bytes = qmsg_types::encode(&message).expect("host messages always encode");
             if sink.send(Frame::Binary(bytes.into())).await.is_err() {
                 break;
             }
@@ -485,12 +523,23 @@ impl Session {
                 }
                 None
             }
-            ProviderMessage::Emit(message) => {
+            ProviderMessage::Message(event) => {
                 let _ = self
                     .events
                     .send(ProviderEvent::Message {
                         provider: self.name.clone(),
-                        message,
+                        event,
+                    })
+                    .await;
+                None
+            }
+            ProviderMessage::Sent { request, result } => {
+                let _ = self
+                    .events
+                    .send(ProviderEvent::Sent {
+                        provider: self.name.clone(),
+                        request,
+                        result,
                     })
                     .await;
                 None

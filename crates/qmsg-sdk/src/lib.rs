@@ -24,11 +24,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 pub use qmsg_types::{
-    self as types, Channel, ChannelKind, Command, Content, ContentKind, DirectoryUpdate, LogLevel,
-    Media, MediaSource, Message, Organization, ProviderConfig, User,
+    self as types, Channel, ChannelKind, ChannelRef, Command, Content, ContentKind,
+    DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageEvent, Organization,
+    ProviderConfig, User,
 };
 use qmsg_types::{HostMessage, ProviderMessage};
-use tungstenite::{WebSocket, protocol::Message as Frame};
+use tungstenite::WebSocket;
+use tungstenite::protocol::{Message as Frame, WebSocketConfig};
 
 #[doc(hidden)]
 pub mod bindings {
@@ -64,8 +66,15 @@ impl Context {
             .strip_prefix("ws://")
             .and_then(|rest| rest.split('/').next())
             .ok_or_else(|| format!("invalid host url `{}`", config.host_url))?;
-        let (socket, _) = tungstenite::client(&config.host_url, TcpStream::connect(addr)?)
-            .map_err(|e| e.to_string())?;
+        let limits = WebSocketConfig::default()
+            .max_message_size(Some(types::MAX_FRAME))
+            .max_frame_size(Some(types::MAX_FRAME));
+        let (socket, _) = tungstenite::client::client_with_config(
+            &config.host_url,
+            TcpStream::connect(addr)?,
+            Some(limits),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             config,
             socket,
@@ -94,14 +103,21 @@ impl Context {
         });
     }
 
-    /// Hands a message received from the platform to the orchestrator.
-    pub fn emit(&mut self, message: Message) -> Result {
-        self.send(&ProviderMessage::Emit(message))
+    /// Tells the orchestrator something happened to a message: a [`Message`]
+    /// that was received, or a [`MessageEvent`] such as an edit.
+    pub fn emit(&mut self, event: impl Into<MessageEvent>) -> Result {
+        self.send(&ProviderMessage::Message(event.into()))
     }
 
-    /// Tells the orchestrator about a change to the organizations and channels
-    /// the provider is part of, including direct messages outside any
-    /// organization. Report a channel before emitting messages from it.
+    /// Answers a [`Command::Send`] with the sent message's id, or why it
+    /// wasn't sent.
+    pub fn sent(&mut self, request: u64, result: std::result::Result<String, String>) -> Result {
+        self.send(&ProviderMessage::Sent { request, result })
+    }
+
+    /// Tells the orchestrator about a change to the organizations, users and
+    /// channels the provider is part of. Report a channel and its users before
+    /// emitting messages from it.
     pub fn directory(&mut self, update: DirectoryUpdate) -> Result {
         self.send(&ProviderMessage::Directory(update))
     }
@@ -170,9 +186,19 @@ impl Context {
         }
     }
 
+    /// Fails without sending if the message is over [`types::MAX_FRAME`],
+    /// which would otherwise close the connection.
     fn send(&mut self, message: &ProviderMessage) -> Result {
-        self.socket
-            .send(Frame::Binary(types::encode(message)?.into()))?;
+        let bytes = types::encode(message)?;
+        if bytes.len() > types::MAX_FRAME {
+            return Err(format!(
+                "message is {} bytes, over the {} byte limit",
+                bytes.len(),
+                types::MAX_FRAME
+            )
+            .into());
+        }
+        self.socket.send(Frame::Binary(bytes.into()))?;
         Ok(())
     }
 

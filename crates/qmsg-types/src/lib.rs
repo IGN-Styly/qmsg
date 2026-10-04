@@ -4,10 +4,22 @@
 //! one postcard-encoded [`ProviderMessage`] or [`HostMessage`].
 //!
 //! These are encoded with postcard, which is not self-describing, so both
-//! sides must agree on the exact layout. Adding an enum variant at the end is
-//! compatible as long as it is only sent to code that knows it. Any other
-//! change, including adding a field, breaks existing providers and needs an
-//! [`ABI_VERSION`] bump.
+//! sides must agree on the exact layout. A provider only loads when its
+//! [`ABI_VERSION`] matches the orchestrator's exactly, so any change to these
+//! types, including a new enum variant, needs a bump.
+//!
+//! # Addressing
+//!
+//! A provider is part of any number of [`Organization`]s, each with its own
+//! users and channels. Platforms that have users and channels outside any
+//! container, such as Discord direct messages or Signal groups, put them in
+//! the provider's standalone scope instead, addressed with no organization.
+//! Use an organization whenever the platform has one: Slack direct messages
+//! belong to their workspace.
+//!
+//! Ids are chosen by the provider. A user or channel id is unique within its
+//! scope, a message id within its channel. A [`Message`]'s author, a
+//! channel's members and its parent are all in the channel's scope.
 
 use std::collections::BTreeMap;
 
@@ -25,17 +37,63 @@ pub struct ProviderConfig {
     pub settings: BTreeMap<String, String>,
 }
 
-/// A message sent to or received from a channel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    /// The [`Organization`] the channel belongs to, or `None` for channels
-    /// outside any, such as direct messages.
+/// Largest encoded message either side may send. Bigger ones are refused
+/// before they are sent, rather than dropping the connection.
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// Where a channel is: in an organization, or in the provider's standalone
+/// scope when `organization` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChannelRef {
     pub organization: Option<String>,
     pub channel: String,
-    /// The author's [`User`] id.
+}
+
+impl ChannelRef {
+    pub fn new(organization: Option<&str>, channel: impl Into<String>) -> Self {
+        Self {
+            organization: organization.map(str::to_owned),
+            channel: channel.into(),
+        }
+    }
+}
+
+/// A message in a channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    /// Unique within the channel.
+    pub id: String,
+    pub channel: ChannelRef,
+    /// The author's [`User`] id, in the channel's scope.
     pub author: String,
+    /// When it was sent, in milliseconds since the Unix epoch.
+    pub sent_at: u64,
+    /// The id of the message this replies to, in the same channel.
+    pub reply_to: Option<String>,
     /// The parts of the message, in order, such as a caption and its image.
     pub content: Vec<Content>,
+}
+
+/// Something that happened to a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageEvent {
+    /// A new message, including ones the account sent itself.
+    Received(Message),
+    Edited {
+        channel: ChannelRef,
+        id: String,
+        content: Vec<Content>,
+    },
+    Deleted {
+        channel: ChannelRef,
+        id: String,
+    },
+}
+
+impl From<Message> for MessageEvent {
+    fn from(message: Message) -> Self {
+        Self::Received(message)
+    }
 }
 
 /// One part of a [`Message`].
@@ -79,6 +137,7 @@ pub struct Media {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaSource {
+    /// The file itself. The whole message must fit in [`MAX_FRAME`].
     Bytes(Vec<u8>),
     /// Where the platform hosts the file.
     Url(String),
@@ -96,40 +155,81 @@ pub enum ContentKind {
     Custom(String),
 }
 
+impl ContentKind {
+    pub fn matches(&self, content: &Content) -> bool {
+        match (self, content) {
+            (Self::Text, Content::Text(_))
+            | (Self::Image, Content::Image(_))
+            | (Self::Video, Content::Video(_))
+            | (Self::Audio, Content::Audio(_))
+            | (Self::File, Content::File(_)) => true,
+            (Self::Custom(a), Content::Custom { kind: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// A group on a platform, such as a Discord server or a Slack workspace.
-///
-/// Ids are chosen by the provider and only need to be unique within it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Organization {
+    /// Unique within the provider.
     pub id: String,
     pub name: String,
+    /// The account's own user id in the organization, if it has one.
+    pub me: Option<String>,
+    /// Can be partial, such as when the platform sends large member lists in
+    /// chunks; send the rest with [`DirectoryUpdate::UserUpserted`].
     pub users: Vec<User>,
     pub channels: Vec<Channel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
-    /// Unique within the user's organization.
+    /// Unique within the user's scope.
     pub id: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
-    /// Unique within the channel's organization, or among the provider's
-    /// channels outside any.
+    /// Unique within the channel's scope.
     pub id: String,
     pub name: String,
     pub kind: ChannelKind,
+    /// The channel this one is in, such as a thread's channel or a channel's
+    /// category.
+    pub parent: Option<String>,
+    /// Where the channel sorts among its siblings, lowest first.
+    pub position: Option<u32>,
+    /// The ids of the users in the channel, or `None` when it is open to its
+    /// whole organization or the platform doesn't say.
+    pub members: Option<Vec<String>>,
     /// What can be sent to the channel. Empty for channels that can't be
-    /// written to, such as a voice channel without text chat.
-    pub inputs: Vec<ContentKind>,
+    /// written to, such as a voice channel without text chat. Only a hint:
+    /// the platform can still refuse a message, such as for its size or the
+    /// account's permissions.
+    pub accepted_content: Vec<ContentKind>,
 }
 
 impl Channel {
-    /// Whether the channel takes `content`.
+    /// A channel with nothing but its id, name and kind set.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, kind: ChannelKind) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            parent: None,
+            position: None,
+            members: None,
+            accepted_content: Vec::new(),
+        }
+    }
+
+    /// Whether `content`'s kind is in [`Channel::accepted_content`].
     pub fn accepts(&self, content: &Content) -> bool {
-        self.inputs.contains(&content.kind())
+        self.accepted_content
+            .iter()
+            .any(|kind| kind.matches(content))
     }
 }
 
@@ -142,6 +242,10 @@ pub enum ChannelKind {
     Announcement,
     /// Holds threads rather than messages.
     Forum,
+    /// A conversation branched off another channel, its parent.
+    Thread,
+    /// Groups other channels, which name it as their parent.
+    Category,
     /// A conversation between two users.
     Direct,
     /// A conversation between a few users, outside any channel list.
@@ -150,30 +254,33 @@ pub enum ChannelKind {
     Custom(String),
 }
 
-/// A change to the organizations and channels a provider is part of.
+/// A change to the organizations, users and channels a provider is part of.
+///
+/// Upserts add the item, or replace the one with the same id. Removals of
+/// items that aren't there are not an error for the provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectoryUpdate {
     /// Adds an organization, or replaces it along with its users and channels.
-    OrganizationSet(Organization),
+    OrganizationUpserted(Organization),
+    /// The account left the organization, or it was deleted.
     OrganizationRemoved {
         id: String,
     },
-    /// Adds a user to an organization, or replaces the one with its id.
-    UserSet {
-        organization: String,
+    UserUpserted {
+        organization: Option<String>,
         user: User,
     },
     UserRemoved {
-        organization: String,
+        organization: Option<String>,
         id: String,
     },
-    /// Adds a channel, or replaces the one with its id. Channels outside any
-    /// organization, such as direct messages, have no `organization`.
-    ChannelSet {
+    ChannelUpserted {
         organization: Option<String>,
         channel: Channel,
     },
-    ChannelRemoved {
+    ChannelRemoved(ChannelRef),
+    /// Sets the account's own user id in a scope.
+    Me {
         organization: Option<String>,
         id: String,
     },
@@ -182,9 +289,14 @@ pub enum DirectoryUpdate {
 /// Work the orchestrator hands to a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    /// Sends a message. The provider answers with
+    /// [`ProviderMessage::Sent`], and reports the message itself as
+    /// [`MessageEvent::Received`] like any other.
     Send {
-        organization: Option<String>,
-        channel: String,
+        /// Chosen by the orchestrator, to match the answer to the command.
+        request: u64,
+        channel: ChannelRef,
+        reply_to: Option<String>,
         content: Vec<Content>,
     },
     Shutdown,
@@ -206,8 +318,8 @@ pub enum ProviderMessage {
         level: LogLevel,
         message: String,
     },
-    /// A message received from the platform.
-    Emit(Message),
+    /// Something happened to a message on the platform.
+    Message(MessageEvent),
     /// Answered with [`HostMessage::Secret`].
     SecretGet {
         key: String,
@@ -221,9 +333,16 @@ pub enum ProviderMessage {
     SecretDelete {
         key: String,
     },
-    /// A change to the organizations and channels the provider is part of.
-    /// Sent before any message in them, and again whenever they change.
+    /// A change to the organizations, users and channels the provider is
+    /// part of. Sent before any message in them, and again whenever they
+    /// change.
     Directory(DirectoryUpdate),
+    /// The answer to a [`Command::Send`]: the sent message's id, or why it
+    /// wasn't sent.
+    Sent {
+        request: u64,
+        result: Result<String, String>,
+    },
 }
 
 /// Sent from the orchestrator to a provider.

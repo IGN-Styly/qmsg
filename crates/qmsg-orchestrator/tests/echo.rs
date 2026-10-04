@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use qmsg_orchestrator::{Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec};
 use qmsg_types::{
-    Channel, ChannelKind, Command, Content, ContentKind, DirectoryUpdate, Media, MediaSource,
-    Message,
+    Channel, ChannelKind, ChannelRef, Command, Content, ContentKind, DirectoryUpdate, MAX_FRAME,
+    Media, MediaSource, Message, MessageEvent,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -90,19 +90,50 @@ async fn started(events: &mut mpsc::Receiver<ProviderEvent>) {
     let ProviderEvent::Directory { .. } = next(events).await else {
         panic!("expected the organization");
     };
-    let ProviderEvent::Message { .. } = next(events).await else {
-        panic!("expected the greeting");
-    };
+    received(events).await;
+}
+
+async fn received(events: &mut mpsc::Receiver<ProviderEvent>) -> Message {
+    match next(events).await {
+        ProviderEvent::Message {
+            event: MessageEvent::Received(message),
+            ..
+        } => message,
+        other => panic!("expected a message, got {other:?}"),
+    }
+}
+
+async fn sent(events: &mut mpsc::Receiver<ProviderEvent>) -> (u64, Result<String, String>) {
+    match next(events).await {
+        ProviderEvent::Sent {
+            request, result, ..
+        } => (request, result),
+        other => panic!("expected a send result, got {other:?}"),
+    }
+}
+
+async fn exited(events: &mut mpsc::Receiver<ProviderEvent>) -> Result<(), String> {
+    match next(events).await {
+        ProviderEvent::Exited { result, .. } => result,
+        other => panic!("expected the provider to exit, got {other:?}"),
+    }
 }
 
 fn text(text: &str) -> Vec<Content> {
     vec![Content::Text(text.into())]
 }
 
-fn send(channel: &str, content: Vec<Content>) -> Command {
+/// The echo server's only channel.
+fn home(port: u16) -> ChannelRef {
+    let server = format!("127.0.0.1:{port}");
+    ChannelRef::new(Some(&server), server.clone())
+}
+
+fn send(request: u64, channel: ChannelRef, content: Vec<Content>) -> Command {
     Command::Send {
-        organization: None,
-        channel: channel.into(),
+        request,
+        channel,
+        reply_to: None,
         content,
     }
 }
@@ -119,17 +150,15 @@ async fn provider_reports_its_organization() {
     let ProviderEvent::Directory { provider, update } = next(&mut events).await else {
         panic!("expected the organization");
     };
-    assert!(matches!(update, DirectoryUpdate::OrganizationSet(_)));
-    directory.apply(&provider, update);
+    assert!(matches!(update, DirectoryUpdate::OrganizationUpserted(_)));
+    directory.apply(&provider, update).unwrap();
 
-    let channel = directory.channel("echo", Some(&server), &server).unwrap();
+    let channel = directory.channel("echo", &home(port)).unwrap();
     assert_eq!(
         channel,
         &Channel {
-            id: server.clone(),
-            name: server.clone(),
-            kind: ChannelKind::Text,
-            inputs: vec![ContentKind::Text],
+            accepted_content: vec![ContentKind::Text],
+            ..Channel::new(&server, &server, ChannelKind::Text)
         }
     );
     assert!(channel.accepts(&Content::Text("hi".into())));
@@ -138,84 +167,119 @@ async fn provider_reports_its_organization() {
         mime: Some("image/png".into()),
         source: MediaSource::Url("https://example.com/a.png".into()),
     })));
+    let scope = directory.scope("echo", Some(&server)).unwrap();
+    assert_eq!(scope.me(), Some("me"));
 
-    // The greeting comes from the organization's channel.
-    let ProviderEvent::Message { message, .. } = next(&mut events).await else {
-        panic!("expected the greeting");
-    };
-    assert_eq!(
-        message,
-        Message {
-            organization: Some(server.clone()),
-            channel: server.clone(),
-            author: server,
-            content: text("hello from server"),
-        }
-    );
+    // The greeting comes from the organization's channel, by a known user.
+    let greeting = received(&mut events).await;
+    assert_eq!(greeting.channel, home(port));
+    assert_eq!(greeting.content, text("hello from server"));
+    assert_eq!(directory.author("echo", &greeting).unwrap().id, server);
 }
 
 #[tokio::test]
 async fn provider_owns_its_connection() {
+    let port = start_server().await;
+    let server = format!("127.0.0.1:{port}");
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    provider.send(send(1, home(port), text("ping"))).unwrap();
+    let (request, result) = sent(&mut events).await;
+    assert_eq!(request, 1);
+    let id = result.unwrap();
+    // The sent message is reported like any other, by the account.
+    let mine = received(&mut events).await;
+    assert_eq!(
+        (mine.id.as_str(), mine.author.as_str()),
+        (id.as_str(), "me")
+    );
+    assert_eq!(mine.content, text("ping"));
+
+    let reply = received(&mut events).await;
+    assert_eq!(
+        (
+            &reply.channel,
+            reply.author.as_str(),
+            reply.reply_to.as_deref()
+        ),
+        (&home(port), server.as_str(), Some(id.as_str()))
+    );
+    assert_eq!(reply.content, text("echo: ping"));
+    assert_ne!(reply.id, id);
+
+    // Each line gets its own reply.
+    let content = vec![Content::Text("a\r\nb".into()), Content::Text("c".into())];
+    provider.send(send(2, home(port), content)).unwrap();
+    assert_eq!(sent(&mut events).await.0, 2);
+    received(&mut events).await; // the sent message
+    for expected in ["echo: a", "echo: b", "echo: c"] {
+        assert_eq!(received(&mut events).await.content, text(expected));
+    }
+
+    provider.send(Command::Shutdown).unwrap();
+    // Sent right before the provider returns, so it must still beat `Exited`.
+    assert_eq!(received(&mut events).await.content, text("goodbye"));
+    assert_eq!(exited(&mut events).await, Ok(()));
+}
+
+#[tokio::test]
+async fn sends_the_channel_cannot_take_fail() {
     let port = start_server().await;
     let (orchestrator, _dir) = orchestrator().await;
     let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     started(&mut events).await;
 
-    provider.send(send("general", text("ping"))).unwrap();
-    let ProviderEvent::Message {
-        provider: name,
-        message,
-    } = next(&mut events).await
-    else {
-        panic!("expected the reply");
-    };
-    assert_eq!(name, "echo");
-    assert_eq!(
-        message,
-        Message {
-            organization: Some(format!("127.0.0.1:{port}")),
-            channel: "general".into(),
-            author: format!("127.0.0.1:{port}"),
-            content: text("echo: ping"),
-        }
-    );
+    // A channel the provider never reported.
+    let elsewhere = ChannelRef::new(None, "general");
+    provider.send(send(1, elsewhere, text("ping"))).unwrap();
+    let (request, result) = sent(&mut events).await;
+    assert_eq!(request, 1);
+    assert!(result.is_err());
 
-    // Each line gets its own reply, all in the command's channel. Content the
-    // server can't take is skipped.
+    // Content the channel doesn't accept.
     let image = Content::Image(Media {
         name: Some("cat.png".into()),
         mime: Some("image/png".into()),
         source: MediaSource::Bytes(vec![0x89, b'P', b'N', b'G']),
     });
-    let content = vec![
-        Content::Text("a\r\nb".into()),
-        image,
-        Content::Text("c".into()),
-    ];
-    provider.send(send("general", content)).unwrap();
-    for expected in ["echo: a", "echo: b", "echo: c"] {
-        let message = match next(&mut events).await {
-            ProviderEvent::Message { message, .. } => message,
-            other => panic!("expected a reply, got {other:?}"),
-        };
-        assert_eq!(
-            (message.channel.as_str(), message.content),
-            ("general", text(expected))
-        );
-    }
+    provider
+        .send(send(
+            2,
+            home(port),
+            vec![Content::Text("look".into()), image],
+        ))
+        .unwrap();
+    let (request, result) = sent(&mut events).await;
+    assert_eq!(request, 2);
+    assert!(result.is_err());
 
+    // Nothing was sent, so the next event is the goodbye.
     provider.send(Command::Shutdown).unwrap();
-    // Sent right before the provider returns, so it must still beat `Exited`.
-    let message = match next(&mut events).await {
-        ProviderEvent::Message { message, .. } => message,
-        other => panic!("expected the goodbye, got {other:?}"),
-    };
-    assert_eq!(message.content, text("goodbye"));
-    let ProviderEvent::Exited { result, .. } = next(&mut events).await else {
-        panic!("expected the provider to exit");
-    };
-    assert_eq!(result, Ok(()));
+    assert_eq!(received(&mut events).await.content, text("goodbye"));
+}
+
+#[tokio::test]
+async fn commands_over_the_limit_are_refused() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let huge = Content::File(Media {
+        name: None,
+        mime: None,
+        source: MediaSource::Bytes(vec![0; MAX_FRAME]),
+    });
+    assert!(provider.send(send(1, home(port), vec![huge])).is_err());
+
+    // The connection is still up.
+    provider.send(send(2, home(port), text("ping"))).unwrap();
+    assert_eq!(sent(&mut events).await, (2, Ok("2".into())));
 }
 
 #[tokio::test]
@@ -227,7 +291,7 @@ async fn kill_stops_a_blocked_provider() {
     started(&mut events).await; // the provider now waits for commands
 
     provider.kill();
-    // A killed provider drops its sender without sending `Exited`.
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
     let closed = timeout(Duration::from_secs(5), events.recv())
         .await
         .unwrap();
@@ -243,6 +307,7 @@ async fn dropping_the_handle_stops_the_provider() {
     started(&mut events).await; // the provider now waits for commands
 
     drop(provider);
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
     let closed = timeout(Duration::from_secs(5), events.recv())
         .await
         .unwrap();
@@ -260,12 +325,9 @@ async fn running_providers_have_unique_names() {
     // It would share the running provider's secrets.
     assert!(orchestrator.spawn(spec(port), events_tx.clone()).is_err());
 
-    provider.send(Command::Shutdown).unwrap();
-    next(&mut events).await; // goodbye
-    let ProviderEvent::Exited { .. } = next(&mut events).await else {
-        panic!("expected the provider to exit");
-    };
-    // The name is free again once the provider has exited.
+    provider.kill();
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
+    // The name is free as soon as `Exited` is received.
     let _provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     started(&mut events).await;
 }

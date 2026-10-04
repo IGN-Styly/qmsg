@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use qmsg_orchestrator::{Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec};
-use qmsg_types::{Command, Content, DirectoryUpdate};
+use qmsg_types::{Command, Content, DirectoryUpdate, MessageEvent};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -54,19 +54,30 @@ async fn main() -> anyhow::Result<()> {
     while running > 0 {
         tokio::select! {
             Some(event) = events.recv() => match event {
-                ProviderEvent::Message { provider, message } => {
-                    let organization = message.organization.as_deref().unwrap_or("-");
-                    tracing::info!(
-                        provider,
-                        organization,
-                        channel = message.channel,
-                        author = message.author,
-                        "{}",
-                        describe(&message.content),
-                    );
-                }
+                ProviderEvent::Message { provider, event } => match event {
+                    MessageEvent::Received(message) => {
+                        let author = directory
+                            .author(&provider, &message)
+                            .map_or(message.author.as_str(), |u| u.name.as_str());
+                        tracing::info!(
+                            provider,
+                            organization = message.channel.organization.as_deref().unwrap_or("-"),
+                            channel = message.channel.channel,
+                            id = message.id,
+                            author,
+                            "{}",
+                            describe(&message.content),
+                        );
+                    }
+                    MessageEvent::Edited { channel, id, content } => {
+                        tracing::info!(provider, channel = channel.channel, id, "edited: {}", describe(&content));
+                    }
+                    MessageEvent::Deleted { channel, id } => {
+                        tracing::info!(provider, channel = channel.channel, id, "deleted");
+                    }
+                },
                 ProviderEvent::Directory { provider, update } => {
-                    if let DirectoryUpdate::OrganizationSet(organization) = &update {
+                    if let DirectoryUpdate::OrganizationUpserted(organization) = &update {
                         tracing::info!(
                             provider,
                             organization = organization.id,
@@ -75,9 +86,17 @@ async fn main() -> anyhow::Result<()> {
                             "joined {}",
                             organization.name,
                         );
+                    } else {
+                        tracing::debug!(provider, "{update:?}");
                     }
-                    directory.apply(&provider, update);
+                    if let Err(e) = directory.apply(&provider, update) {
+                        tracing::warn!(provider, "ignored directory update: {e}");
+                    }
                 }
+                ProviderEvent::Sent { provider, request, result } => match result {
+                    Ok(id) => tracing::debug!(provider, request, id, "sent"),
+                    Err(e) => tracing::warn!(provider, request, "send failed: {e}"),
+                },
                 ProviderEvent::Exited { provider, result } => {
                     running -= 1;
                     directory.remove_provider(&provider);
@@ -89,12 +108,12 @@ async fn main() -> anyhow::Result<()> {
             },
             _ = tokio::signal::ctrl_c() => {
                 if shutting_down {
-                    // Killed providers send no `Exited`, so stop waiting.
+                    // Killed providers still send `Exited`, right away.
                     tracing::warn!("killing providers");
                     for handle in &handles {
                         handle.kill();
                     }
-                    break;
+                    continue;
                 }
                 tracing::info!("shutting down, press Ctrl-C again to kill");
                 shutting_down = true;

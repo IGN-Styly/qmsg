@@ -20,21 +20,31 @@ provider owns its network connections and has full TCP and UDP access.
 Each provider runs on its own thread and talks to the orchestrator over a
 WebSocket on localhost, sending postcard-encoded `qmsg-types` messages.
 `wit/qmsg.wit` only exports the entry point and should not need to change.
-Change the types instead. New enum variants go at the end; any other change,
-including adding a field, needs an `ABI_VERSION` bump, because postcard can't
-decode a layout it doesn't know.
+Change the types instead. Any change to them, including a new enum variant,
+needs an `ABI_VERSION` bump: postcard can't decode a layout it doesn't know,
+and a provider only loads when its version matches the orchestrator's. Each
+side refuses to send a message over 64 MiB rather than drop the connection.
 
 Providers report the organizations they are part of, such as Discord servers
 or Slack workspaces, with `Context::directory`. An organization holds users
-and channels. Channels can also stand alone, outside any organization, for
-direct and group messages. Each channel has a kind (text, voice, video, announcement, forum,
-direct, group, or a custom one) and lists the content it accepts as inputs.
-Message content is a list of parts, so one message can carry text, images,
-video, audio, files and custom content together. A provider sends a whole
-organization when it joins, then updates single users and channels as they
+and channels, and says which user is the account itself. Platforms with users
+and channels outside any container, such as Discord direct messages or Signal
+groups, report them with no organization. Slack direct messages belong to
+their workspace, so they go in its organization.
+
+Each channel has a kind (text, voice, video, announcement, forum, thread,
+category, direct, group, or a custom one), an optional parent channel and
+member list, and the content it accepts. A provider sends a whole organization
+when it joins, then upserts or removes single users and channels as they
 change. The orchestrator passes these on as `ProviderEvent::Directory`, and
-`Directory` keeps the current state of each provider's organizations and
-channels.
+`Directory` keeps the current state for each provider.
+
+Messages have an id, a timestamp and an optional message they reply to. Their
+content is a list of parts, so one message can carry text, images, video,
+audio, files and custom content together. Providers emit new messages, edits
+and deletions, including the account's own messages. Each `Command::Send`
+carries a request number, and the provider answers it with the new message's
+id or an error.
 
 Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at
