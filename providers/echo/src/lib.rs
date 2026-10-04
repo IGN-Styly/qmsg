@@ -1,7 +1,8 @@
 //! Example provider that talks a line-based protocol over TCP.
 //!
 //! It connects to the `server` setting, emits the server's greeting, then for
-//! each `Send` command writes the body as a line and emits the reply.
+//! each `Send` command writes the body as a line and emits the reply. On
+//! `Shutdown` it emits a goodbye and returns.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -34,7 +35,14 @@ impl Provider for Echo {
                         body: reply,
                     })?;
                 }
-                Command::Shutdown => break,
+                Command::Shutdown => {
+                    cx.emit(Message {
+                        chat: server.clone(),
+                        author: server.clone(),
+                        body: "goodbye".into(),
+                    })?;
+                    break;
+                }
             }
         }
         Ok(())

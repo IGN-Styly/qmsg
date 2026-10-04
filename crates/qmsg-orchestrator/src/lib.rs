@@ -21,7 +21,8 @@ use qmsg_types::{
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -40,6 +41,9 @@ mod bindings {
 /// How often running providers are made to yield to the executor.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// How long an exited provider's messages may take to arrive before `Exited`
+/// is sent anyway.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A provider to run.
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +75,33 @@ struct Session {
     commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>,
     events: mpsc::UnboundedSender<ProviderEvent>,
     kv: Mutex<HashMap<String, Vec<u8>>>,
+    /// Open connections, counted from the handshake until every frame the
+    /// provider sent has been handled.
+    connections: watch::Sender<usize>,
+}
+
+impl Session {
+    /// Waits until the provider's connections have been read to the end.
+    async fn drained(&self) {
+        let mut connections = self.connections.subscribe();
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, connections.wait_for(|&n| n == 0)).await;
+    }
+}
+
+/// Counts one connection for as long as it is alive.
+struct ConnectionGuard(Arc<Session>);
+
+impl ConnectionGuard {
+    fn new(session: Arc<Session>) -> Self {
+        session.connections.send_modify(|n| *n += 1);
+        Self(session)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connections.send_modify(|n| *n -= 1);
+    }
 }
 
 pub struct Orchestrator {
@@ -78,6 +109,14 @@ pub struct Orchestrator {
     linker: Arc<Linker<WasiState>>,
     sessions: Sessions,
     addr: SocketAddr,
+    server: JoinHandle<()>,
+}
+
+impl Drop for Orchestrator {
+    /// Stops the WebSocket server and closes every provider's connection.
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
 
 impl Orchestrator {
@@ -102,13 +141,14 @@ impl Orchestrator {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let sessions = Sessions::default();
-        tokio::spawn(serve(listener, sessions.clone()));
+        let server = tokio::spawn(serve(listener, sessions.clone()));
 
         Ok(Self {
             engine,
             linker: Arc::new(linker),
             sessions,
             addr,
+            server,
         })
     }
 
@@ -123,15 +163,17 @@ impl Orchestrator {
     ) -> anyhow::Result<ProviderHandle> {
         let token = new_token()?;
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        self.sessions.lock().unwrap().insert(
-            token.clone(),
-            Arc::new(Session {
-                name: spec.name.clone(),
-                commands: tokio::sync::Mutex::new(commands_rx),
-                events: events.clone(),
-                kv: Mutex::default(),
-            }),
-        );
+        let session = Arc::new(Session {
+            name: spec.name.clone(),
+            commands: tokio::sync::Mutex::new(commands_rx),
+            events: events.clone(),
+            kv: Mutex::default(),
+            connections: watch::Sender::new(0),
+        });
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(token.clone(), session.clone());
 
         let kill = Arc::new(Notify::new());
         let killed = kill.clone();
@@ -150,8 +192,16 @@ impl Orchestrator {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async {
+                        let finished = async {
+                            let result = run(engine, &linker, spec, host_url).await;
+                            // The provider's socket closed when its store was
+                            // dropped; handle what it sent before reporting
+                            // the exit, so `Exited` is always its last event.
+                            session.drained().await;
+                            result
+                        };
                         tokio::select! {
-                            result = run(engine, &linker, spec, host_url) => Some(result),
+                            result = finished => Some(result),
                             () = killed.notified() => None,
                         }
                     }),
@@ -217,7 +267,11 @@ async fn run(
     let state = WasiState {
         wasi: wasi_ctx(),
         table: ResourceTable::new(),
-        limits: StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build(),
+        limits: StoreLimitsBuilder::new()
+            .memory_size(MEMORY_LIMIT)
+            // `memory_size` applies to each memory, so allow only one.
+            .memories(1)
+            .build(),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|state| &mut state.limits);
@@ -269,70 +323,108 @@ fn new_token() -> anyhow::Result<String> {
 }
 
 async fn serve(listener: TcpListener, sessions: Sessions) {
+    // Owning the connection tasks means aborting `serve` also closes them.
+    let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(connection(stream, sessions.clone()));
-            }
-            Err(e) => tracing::warn!("accepting provider connection: {e}"),
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(connection(stream, sessions.clone()));
+                }
+                Err(e) => tracing::warn!("accepting provider connection: {e}"),
+            },
+            Some(_) = connections.join_next() => {}
         }
     }
 }
 
-/// Serves one provider's WebSocket until either side closes it.
+/// Serves one provider's WebSocket until the provider closes it.
 // tungstenite's handshake callback fixes the error type.
 #[allow(clippy::result_large_err)]
 async fn connection(stream: TcpStream, sessions: Sessions) {
-    let mut session = None;
+    let mut guard = None;
     let accept = tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response| {
         let token = request.uri().path().trim_start_matches('/');
-        session = sessions.lock().unwrap().get(token).cloned();
-        match session {
+        // Counted before the handshake completes, so the provider can't
+        // finish and be reported as exited before this connection counts.
+        guard = sessions
+            .lock()
+            .unwrap()
+            .get(token)
+            .cloned()
+            .map(ConnectionGuard::new);
+        match guard {
             Some(_) => Ok(response),
             None => Err(not_found()),
         }
     });
-    let mut socket = match accept.await {
+    let socket = match accept.await {
         Ok(socket) => socket,
         Err(e) => {
             tracing::debug!("rejected provider connection: {e}");
             return;
         }
     };
-    let Some(session) = session else { return };
+    let Some(guard) = guard else { return };
+    let session = &guard.0;
 
-    // Held for the connection's lifetime, so a second connection for the same
-    // provider waits until the first one closes.
-    let mut commands = session.commands.lock().await;
-    loop {
-        let reply = tokio::select! {
-            command = commands.recv() => match command {
-                Some(command) => Some(HostMessage::Command(command)),
-                None => break,
-            },
-            frame = socket.next() => match frame {
-                Some(Ok(Frame::Binary(bytes))) => match qmsg_types::decode(&bytes) {
-                    Ok(message) => session.handle(message),
+    // Reading and writing run independently, so a provider that is busy
+    // writing a large message can't deadlock against a large command.
+    let (mut sink, mut stream) = socket.split();
+    let (replies_tx, mut replies) = mpsc::unbounded_channel();
+
+    let reader = async move {
+        while let Some(frame) = stream.next().await {
+            match frame {
+                Ok(Frame::Binary(bytes)) => match qmsg_types::decode(&bytes) {
+                    Ok(message) => {
+                        if let Some(reply) = session.handle(message) {
+                            let _ = replies_tx.send(reply);
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(provider = session.name, "invalid message: {e}");
                         break;
                     }
                 },
-                Some(Ok(Frame::Close(_))) | None => break,
-                Some(Ok(_)) => None,
-                Some(Err(e)) => {
+                Ok(Frame::Close(_)) => break,
+                Ok(_) => {}
+                Err(e) => {
                     tracing::debug!(provider = session.name, "connection error: {e}");
                     break;
                 }
-            },
-        };
-        if let Some(reply) = reply {
-            let bytes = qmsg_types::encode(&reply).expect("host messages always encode");
-            if socket.send(Frame::Binary(bytes.into())).await.is_err() {
+            }
+        }
+        // Dropping `replies_tx` here ends the writer.
+    };
+
+    let writer = async {
+        // Held for the connection's lifetime, so a second connection for the
+        // same provider gets no commands until the first one closes.
+        let mut commands = session.commands.lock().await;
+        let mut commands_open = true;
+        loop {
+            let message = tokio::select! {
+                command = commands.recv(), if commands_open => match command {
+                    Some(command) => HostMessage::Command(command),
+                    None => {
+                        commands_open = false;
+                        continue;
+                    }
+                },
+                reply = replies.recv() => match reply {
+                    Some(reply) => reply,
+                    None => break,
+                },
+            };
+            let bytes = qmsg_types::encode(&message).expect("host messages always encode");
+            if sink.send(Frame::Binary(bytes.into())).await.is_err() {
                 break;
             }
         }
-    }
+    };
+
+    tokio::join!(reader, writer);
 }
 
 impl Session {

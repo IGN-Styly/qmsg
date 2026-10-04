@@ -106,6 +106,12 @@ async fn provider_owns_its_connection() {
     );
 
     provider.send(Command::Shutdown).unwrap();
+    // Sent right before the provider returns, so it must still beat `Exited`.
+    let message = match next(&mut events).await {
+        ProviderEvent::Message { message, .. } => message,
+        other => panic!("expected the goodbye, got {other:?}"),
+    };
+    assert_eq!(message.body, "goodbye");
     let ProviderEvent::Exited { result, .. } = next(&mut events).await else {
         panic!("expected the provider to exit");
     };
