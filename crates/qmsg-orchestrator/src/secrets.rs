@@ -238,13 +238,17 @@ fn restrict(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Otherwise the permissions of whatever it points to would change.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::other("is a symlink"));
+        }
         // Created with the right mode, so it is never briefly readable.
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            .open(path)?
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -356,6 +360,20 @@ mod tests {
         Secrets::open(dir.path(), Encryption::Plaintext).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_symlink_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&other, dir.path().join("qmsg.db")).unwrap();
+        assert!(Secrets::open(dir.path(), Encryption::Plaintext).is_err());
+        let mode = std::fs::metadata(&other).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
