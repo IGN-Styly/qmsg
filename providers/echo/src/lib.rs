@@ -1,7 +1,7 @@
 //! Example provider that talks a line-based protocol over TCP.
 //!
 //! It connects to the `server` setting, emits the server's greeting, then for
-//! each `Send` command writes the body as a line and emits the reply. On
+//! each `Send` command writes each line of the body and emits each reply. On
 //! `Shutdown` it emits a goodbye and returns.
 
 use std::io::{BufRead, BufReader, Write};
@@ -26,19 +26,18 @@ impl Provider for Echo {
 
         while let Some(command) = cx.next_command(None)? {
             match command {
-                // The protocol is one line per message, so a line break
-                // would make the replies fall out of step with the commands.
-                Command::Send { body, .. } if body.contains(['\n', '\r']) => {
-                    cx.log(LogLevel::Warn, "skipping a message with a line break");
-                }
+                // The server answers each line, so send the lines one at a
+                // time to keep every reply with its command's chat.
                 Command::Send { chat, body } => {
-                    writeln!(conn.get_mut(), "{body}")?;
-                    let reply = read_line(&mut conn)?;
-                    cx.emit(Message {
-                        chat,
-                        author: server.clone(),
-                        body: reply,
-                    })?;
+                    for line in body.split('\n') {
+                        writeln!(conn.get_mut(), "{line}")?;
+                        let reply = read_line(&mut conn)?;
+                        cx.emit(Message {
+                            chat: chat.clone(),
+                            author: server.clone(),
+                            body: reply,
+                        })?;
+                    }
                 }
                 Command::Shutdown => {
                     cx.emit(Message {

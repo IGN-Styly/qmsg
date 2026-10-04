@@ -115,20 +115,33 @@ impl Context {
     pub fn kv_get(&mut self, key: impl Into<String>) -> Result<Option<Vec<u8>>> {
         let key = key.into();
         self.send(&ProviderMessage::KvGet { key: key.clone() })?;
-        loop {
-            match self.receive()? {
-                HostMessage::Value { key: k, value } if k == key => return Ok(value),
-                HostMessage::Command(command) => self.pending.push_back(command),
-                other => return Err(unexpected(other)),
-            }
+        match self.reply()? {
+            HostMessage::Value { key: k, value } if k == key => Ok(value),
+            other => Err(unexpected(other)),
         }
     }
 
+    /// Stores a value. Fails if it doesn't fit in the provider's KV storage.
     pub fn kv_set(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Result {
+        let key = key.into();
         self.send(&ProviderMessage::KvSet {
-            key: key.into(),
+            key: key.clone(),
             value: value.into(),
-        })
+        })?;
+        match self.reply()? {
+            HostMessage::Stored { key: k, result } if k == key => Ok(result?),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Waits for the answer to a request, saving commands that arrive first.
+    fn reply(&mut self) -> Result<HostMessage> {
+        loop {
+            match self.receive()? {
+                HostMessage::Command(command) => self.pending.push_back(command),
+                reply => return Ok(reply),
+            }
+        }
     }
 
     fn send(&mut self, message: &ProviderMessage) -> Result {

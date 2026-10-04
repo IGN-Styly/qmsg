@@ -402,18 +402,13 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
         while let Some(frame) = stream.next().await {
             match frame {
                 Ok(Frame::Binary(bytes)) => match qmsg_types::decode(&bytes) {
-                    Ok(message) => match session.handle(message).await {
-                        Ok(Some(reply)) => {
-                            if replies_tx.send(reply).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(provider = session.name, "closing connection: {e}");
+                    Ok(message) => {
+                        if let Some(reply) = session.handle(message).await
+                            && replies_tx.send(reply).await.is_err()
+                        {
                             break;
                         }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(provider = session.name, "invalid message: {e}");
                         break;
@@ -461,9 +456,7 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
 
 impl Session {
     /// Handles a message from the provider, returning the reply if it needs one.
-    ///
-    /// An error means the provider misbehaved and its connection is closed.
-    async fn handle(&self, message: ProviderMessage) -> Result<Option<HostMessage>, String> {
+    async fn handle(&self, message: ProviderMessage) -> Option<HostMessage> {
         match message {
             ProviderMessage::Log { level, message } => {
                 let provider = &self.name;
@@ -474,7 +467,7 @@ impl Session {
                     LogLevel::Debug => tracing::debug!(provider, "{message}"),
                     LogLevel::Trace => tracing::trace!(provider, "{message}"),
                 }
-                Ok(None)
+                None
             }
             ProviderMessage::Emit(message) => {
                 let _ = self
@@ -484,22 +477,24 @@ impl Session {
                         message,
                     })
                     .await;
-                Ok(None)
+                None
             }
             ProviderMessage::KvGet { key } => {
                 let value = self.kv.lock().unwrap().values.get(&key).cloned();
-                Ok(Some(HostMessage::Value { key, value }))
+                Some(HostMessage::Value { key, value })
             }
             ProviderMessage::KvSet { key, value } => {
                 let mut kv = self.kv.lock().unwrap();
                 let old = kv.values.get(&key).map_or(0, |v| key.len() + v.len());
                 let bytes = kv.bytes - old + key.len() + value.len();
-                if bytes > KV_LIMIT {
-                    return Err(format!("KV storage over its {KV_LIMIT} byte limit"));
-                }
-                kv.bytes = bytes;
-                kv.values.insert(key, value);
-                Ok(None)
+                let result = if bytes > KV_LIMIT {
+                    Err(format!("KV storage is limited to {KV_LIMIT} bytes"))
+                } else {
+                    kv.bytes = bytes;
+                    kv.values.insert(key.clone(), value);
+                    Ok(())
+                };
+                Some(HostMessage::Stored { key, result })
             }
         }
     }

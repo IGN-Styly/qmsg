@@ -108,6 +108,24 @@ async fn provider_owns_its_connection() {
         }
     );
 
+    // Each line gets its own reply, all in the command's chat.
+    provider
+        .send(Command::Send {
+            chat: "general".into(),
+            body: "a\r\nb".into(),
+        })
+        .unwrap();
+    for expected in ["echo: a", "echo: b"] {
+        let message = match next(&mut events).await {
+            ProviderEvent::Message { message, .. } => message,
+            other => panic!("expected a reply, got {other:?}"),
+        };
+        assert_eq!(
+            (message.chat.as_str(), message.body.as_str()),
+            ("general", expected)
+        );
+    }
+
     provider.send(Command::Shutdown).unwrap();
     // Sent right before the provider returns, so it must still beat `Exited`.
     let message = match next(&mut events).await {

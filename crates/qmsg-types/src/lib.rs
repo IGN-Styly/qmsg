@@ -61,6 +61,7 @@ pub enum ProviderMessage {
     KvGet {
         key: String,
     },
+    /// Answered with [`HostMessage::Stored`].
     KvSet {
         key: String,
         value: Vec<u8>,
@@ -75,6 +76,12 @@ pub enum HostMessage {
     Value {
         key: String,
         value: Option<Vec<u8>>,
+    },
+    /// The answer to a [`ProviderMessage::KvSet`]. Fails when the value
+    /// doesn't fit in the provider's KV storage.
+    Stored {
+        key: String,
+        result: Result<(), String>,
     },
 }
 
