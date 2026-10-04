@@ -41,9 +41,6 @@ mod bindings {
 /// How often running providers are made to yield to the executor.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-/// How long an exited provider's messages may take to arrive before `Exited`
-/// is sent anyway.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A provider to run.
 #[derive(Debug, Clone, Deserialize)]
@@ -82,9 +79,12 @@ struct Session {
 
 impl Session {
     /// Waits until the provider's connections have been read to the end.
+    ///
+    /// Only called once the provider's store is dropped, which closes its
+    /// sockets, so every connection is already on its way to finishing.
     async fn drained(&self) {
         let mut connections = self.connections.subscribe();
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, connections.wait_for(|&n| n == 0)).await;
+        let _ = connections.wait_for(|&n| n == 0).await;
     }
 }
 
@@ -228,6 +228,7 @@ impl Orchestrator {
     }
 }
 
+/// Controls a running provider. Dropping it kills the provider.
 pub struct ProviderHandle {
     commands: mpsc::UnboundedSender<Command>,
     kill: Arc<Notify>,
@@ -246,6 +247,13 @@ impl ProviderHandle {
     /// No `Exited` event is sent for a killed provider.
     pub fn kill(&self) {
         self.kill.notify_one();
+    }
+}
+
+impl Drop for ProviderHandle {
+    /// Without a handle nothing can send the provider commands or stop it.
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 

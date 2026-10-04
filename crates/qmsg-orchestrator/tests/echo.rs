@@ -133,3 +133,18 @@ async fn kill_stops_a_blocked_provider() {
         .unwrap();
     assert!(closed.is_none());
 }
+
+#[tokio::test]
+async fn dropping_the_handle_stops_the_provider() {
+    let port = start_server().await;
+    let orchestrator = Orchestrator::new().await.unwrap();
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    next(&mut events).await; // greeting; the provider now waits for commands
+
+    drop(provider);
+    let closed = timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap();
+    assert!(closed.is_none());
+}
