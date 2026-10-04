@@ -183,6 +183,12 @@ impl Orchestrator {
         events: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<ProviderHandle> {
         let token = new_token()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        // Secrets are keyed by name, so two running providers with the same
+        // name would share them.
+        if sessions.values().any(|s| s.name == spec.name) {
+            bail!("a provider named `{}` is already running", spec.name);
+        }
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let session = Arc::new(Session {
             name: spec.name.clone(),
@@ -191,10 +197,8 @@ impl Orchestrator {
             secrets: self.secrets.clone(),
             connections: watch::Sender::new(0),
         });
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), session.clone());
+        sessions.insert(token.clone(), session.clone());
+        drop(sessions);
 
         let kill = Arc::new(Notify::new());
         let killed = kill.clone();

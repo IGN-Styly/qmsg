@@ -42,18 +42,32 @@ impl Secrets {
     pub(crate) fn open(dir: &Path, encryption: Encryption) -> anyhow::Result<Self> {
         create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("qmsg.db");
+        restrict(&path).with_context(|| format!("securing {}", path.display()))?;
         let db = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        let cipher = match encryption {
-            Encryption::Keychain => match master_key() {
-                Ok(key) => Some(XChaCha20Poly1305::new(&key)),
-                Err(e) => {
-                    tracing::warn!("no OS keychain, storing secrets as plain text: {e:#}");
-                    None
+        let mut secrets = Self::new(db, None)?;
+        if encryption == Encryption::Keychain {
+            match master_key() {
+                Ok(key) => secrets.cipher = Some(XChaCha20Poly1305::new(&key)),
+                // Encrypted rows mean a keychain worked before, so this is a
+                // fault, not a machine without one. Falling back would store
+                // new secrets as plain text where they used to be encrypted.
+                Err(e) if secrets.has_encrypted()? => {
+                    return Err(
+                        e.context("OS keychain unavailable, but stored secrets are encrypted")
+                    );
                 }
-            },
-            Encryption::Plaintext => None,
-        };
-        Self::new(db, cipher)
+                Err(e) => tracing::warn!("no OS keychain, storing secrets as plain text: {e:#}"),
+            }
+        }
+        Ok(secrets)
+    }
+
+    fn has_encrypted(&self) -> anyhow::Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS (SELECT 1 FROM secrets WHERE nonce IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     fn new(db: Connection, cipher: Option<XChaCha20Poly1305>) -> anyhow::Result<Self> {
@@ -109,6 +123,10 @@ impl Secrets {
     }
 
     pub(crate) fn set(&self, provider: &str, key: &str, value: &[u8]) -> Result<(), String> {
+        let too_big = || format!("secret storage is limited to {LIMIT} bytes");
+        if key.len() + value.len() > LIMIT {
+            return Err(too_big());
+        }
         let (nonce, value) = match &self.cipher {
             Some(cipher) => {
                 let nonce = XNonce::generate();
@@ -139,7 +157,7 @@ impl Secrets {
             )
             .map_err(|e| format!("writing secret: {e}"))?;
         if others as usize + key.len() + value.len() > LIMIT {
-            return Err(format!("secret storage is limited to {LIMIT} bytes"));
+            return Err(too_big());
         }
         tx.execute(
             "INSERT OR REPLACE INTO secrets (provider, key, nonce, value) VALUES (?1, ?2, ?3, ?4)",
@@ -212,6 +230,25 @@ fn create_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)
+}
+
+/// Makes the database readable only by its owner on Unix, since secrets may
+/// be stored as plain text.
+fn restrict(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Created with the right mode, so it is never briefly readable.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,6 +333,32 @@ mod tests {
     }
 
     #[test]
+    fn detects_encrypted_rows() {
+        let secrets = encrypted();
+        assert!(
+            !Secrets::new(Connection::open_in_memory().unwrap(), None)
+                .unwrap()
+                .has_encrypted()
+                .unwrap()
+        );
+        secrets.set("a", "token", b"hunter2").unwrap();
+        assert!(secrets.has_encrypted().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmsg.db");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Secrets::open(dir.path(), Encryption::Plaintext).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
     fn storage_is_limited_per_provider() {
         let secrets = encrypted();
         let half = vec![0; LIMIT / 2];
@@ -303,6 +366,7 @@ mod tests {
         // Replacing a value doesn't count the old one.
         secrets.set("a", "one", &half).unwrap();
         assert!(secrets.set("a", "two", &half).is_err());
+        assert!(secrets.set("c", "big", &vec![0; LIMIT + 1]).is_err());
         secrets.set("b", "two", &half).unwrap();
     }
 }

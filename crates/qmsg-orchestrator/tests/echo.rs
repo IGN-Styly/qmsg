@@ -179,3 +179,24 @@ async fn dropping_the_handle_stops_the_provider() {
         .unwrap();
     assert!(closed.is_none());
 }
+
+#[tokio::test]
+async fn running_providers_have_unique_names() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx.clone()).unwrap();
+    next(&mut events).await; // greeting
+
+    // It would share the running provider's secrets.
+    assert!(orchestrator.spawn(spec(port), events_tx.clone()).is_err());
+
+    provider.send(Command::Shutdown).unwrap();
+    next(&mut events).await; // goodbye
+    let ProviderEvent::Exited { .. } = next(&mut events).await else {
+        panic!("expected the provider to exit");
+    };
+    // The name is free again once the provider has exited.
+    let _provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    next(&mut events).await;
+}
