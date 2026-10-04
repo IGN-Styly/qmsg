@@ -46,15 +46,17 @@ impl Secrets {
         let db = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let mut secrets = Self::new(db, None)?;
         if encryption == Encryption::Keychain {
-            match master_key() {
+            // Encrypted rows mean a keychain worked before, so any failure is
+            // a fault, not a machine without one. Falling back would store new
+            // secrets as plain text, and a new key would orphan the old ones.
+            let encrypted = secrets.has_encrypted()?;
+            // Held while the key is loaded or created, so two orchestrators
+            // starting together don't each create one.
+            let _lock = lock(dir).context("locking the data directory")?;
+            match keychain().and_then(|store| master_key(&*store, !encrypted)) {
                 Ok(key) => secrets.cipher = Some(XChaCha20Poly1305::new(&key)),
-                // Encrypted rows mean a keychain worked before, so this is a
-                // fault, not a machine without one. Falling back would store
-                // new secrets as plain text where they used to be encrypted.
-                Err(e) if secrets.has_encrypted()? => {
-                    return Err(
-                        e.context("OS keychain unavailable, but stored secrets are encrypted")
-                    );
+                Err(e) if encrypted => {
+                    return Err(e.context("can't load the master key for the stored secrets"));
                 }
                 Err(e) => tracing::warn!("no OS keychain, storing secrets as plain text: {e:#}"),
             }
@@ -186,12 +188,15 @@ fn aad(provider: &str, key: &str) -> Vec<u8> {
     qmsg_types::encode(&(provider, key)).expect("strings always encode")
 }
 
-/// Loads the master key from the OS keychain, creating it on first use.
-fn master_key() -> anyhow::Result<Key> {
-    let entry = keychain()?.build(KEYCHAIN_SERVICE, KEYCHAIN_USER, None)?;
+/// Loads the master key from the keychain, creating it if `create` is set.
+fn master_key(store: &CredentialStore, create: bool) -> anyhow::Result<Key> {
+    let entry = store.build(KEYCHAIN_SERVICE, KEYCHAIN_USER, None)?;
     match entry.get_secret() {
         Ok(bytes) => Key::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("the keychain's master key has the wrong length")),
+        Err(keyring_core::Error::NoEntry) if !create => {
+            anyhow::bail!("the OS keychain has no master key")
+        }
         Err(keyring_core::Error::NoEntry) => {
             let key = Key::generate();
             entry.set_secret(&key)?;
@@ -230,6 +235,17 @@ fn create_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)
+}
+
+/// Takes an exclusive lock on the data directory, released when dropped.
+fn lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("qmsg.lock"))?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Makes the database readable only by its owner on Unix, since secrets may
@@ -374,6 +390,15 @@ mod tests {
         assert!(Secrets::open(dir.path(), Encryption::Plaintext).is_err());
         let mode = std::fs::metadata(&other).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn master_key_is_only_created_when_allowed() {
+        let store = keyring_core::mock::Store::new().unwrap();
+        assert!(master_key(&*store, false).is_err());
+        let key = master_key(&*store, true).unwrap();
+        assert_eq!(master_key(&*store, false).unwrap(), key);
+        assert_eq!(master_key(&*store, true).unwrap(), key);
     }
 
     #[test]
