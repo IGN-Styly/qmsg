@@ -2,10 +2,15 @@
 //!
 //! Values are encrypted with XChaCha20-Poly1305 under a master key that lives
 //! in the OS keychain: Keychain on macOS, Credential Manager on Windows and
-//! Secret Service on Linux. Without a keychain, values are stored as plain
-//! text. Each row records whether it is encrypted, so rows written either way
-//! stay readable once a keychain is available, as long as the key is unchanged.
+//! Secret Service on Linux. Each data directory has its own key, named by the
+//! directory's path. Without a keychain, values are stored as plain text. Each
+//! row records whether it is encrypted, so rows written either way stay
+//! readable once a keychain is available, as long as the key is unchanged.
+//!
+//! Only one orchestrator can use a data directory at a time, so nothing else
+//! writes its database or its keychain entry.
 
+use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -17,9 +22,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Total key and value bytes a provider may keep in secret storage.
 const LIMIT: usize = 1024 * 1024;
-/// Identifies the master key in the OS keychain.
+/// The master key's keychain service. Its user is the data directory's path.
 const KEYCHAIN_SERVICE: &str = "qmsg";
-const KEYCHAIN_USER: &str = "master-key";
 
 /// How secret values are protected at rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,25 +39,31 @@ pub(crate) struct Secrets {
     db: Mutex<Connection>,
     /// `None` stores values as plain text.
     cipher: Option<XChaCha20Poly1305>,
+    /// Holds the data directory for as long as this is open.
+    _lock: Option<File>,
 }
 
 impl Secrets {
     /// Opens `qmsg.db` in `dir`, creating both if needed.
     pub(crate) fn open(dir: &Path, encryption: Encryption) -> anyhow::Result<Self> {
         create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("resolving {}", dir.display()))?;
+        let lock = lock(&dir)?;
         let path = dir.join("qmsg.db");
         restrict(&path).with_context(|| format!("securing {}", path.display()))?;
         let db = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let mut secrets = Self::new(db, None)?;
+        secrets._lock = Some(lock);
         if encryption == Encryption::Keychain {
             // Encrypted rows mean a keychain worked before, so any failure is
             // a fault, not a machine without one. Falling back would store new
             // secrets as plain text, and a new key would orphan the old ones.
+            // The lock means no one else can add encrypted rows meanwhile.
             let encrypted = secrets.has_encrypted()?;
-            // Held while the key is loaded or created, so two orchestrators
-            // starting together don't each create one.
-            let _lock = lock(dir).context("locking the data directory")?;
-            match keychain().and_then(|store| master_key(&*store, !encrypted)) {
+            let user = dir.to_string_lossy();
+            match keychain().and_then(|store| master_key(&*store, &user, !encrypted)) {
                 Ok(key) => secrets.cipher = Some(XChaCha20Poly1305::new(&key)),
                 Err(e) if encrypted => {
                     return Err(e.context("can't load the master key for the stored secrets"));
@@ -86,6 +96,7 @@ impl Secrets {
         Ok(Self {
             db: Mutex::new(db),
             cipher,
+            _lock: None,
         })
     }
 
@@ -189,8 +200,8 @@ fn aad(provider: &str, key: &str) -> Vec<u8> {
 }
 
 /// Loads the master key from the keychain, creating it if `create` is set.
-fn master_key(store: &CredentialStore, create: bool) -> anyhow::Result<Key> {
-    let entry = store.build(KEYCHAIN_SERVICE, KEYCHAIN_USER, None)?;
+fn master_key(store: &CredentialStore, user: &str, create: bool) -> anyhow::Result<Key> {
+    let entry = store.build(KEYCHAIN_SERVICE, user, None)?;
     match entry.get_secret() {
         Ok(bytes) => Key::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("the keychain's master key has the wrong length")),
@@ -238,14 +249,23 @@ fn create_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Takes an exclusive lock on the data directory, released when dropped.
-fn lock(dir: &Path) -> std::io::Result<std::fs::File> {
+fn lock(dir: &Path) -> anyhow::Result<File> {
+    let path = dir.join("qmsg.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(dir.join("qmsg.lock"))?;
-    file.lock()?;
-    Ok(file)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => {
+            anyhow::bail!("{} is in use by another orchestrator", dir.display())
+        }
+        Err(TryLockError::Error(e)) => {
+            Err(anyhow::Error::from(e).context(format!("locking {}", path.display())))
+        }
+    }
 }
 
 /// Makes the database readable only by its owner on Unix, since secrets may
@@ -395,10 +415,21 @@ mod tests {
     #[test]
     fn master_key_is_only_created_when_allowed() {
         let store = keyring_core::mock::Store::new().unwrap();
-        assert!(master_key(&*store, false).is_err());
-        let key = master_key(&*store, true).unwrap();
-        assert_eq!(master_key(&*store, false).unwrap(), key);
-        assert_eq!(master_key(&*store, true).unwrap(), key);
+        assert!(master_key(&*store, "/a", false).is_err());
+        let key = master_key(&*store, "/a", true).unwrap();
+        assert_eq!(master_key(&*store, "/a", false).unwrap(), key);
+        assert_eq!(master_key(&*store, "/a", true).unwrap(), key);
+        // Each data directory has its own key.
+        assert_ne!(master_key(&*store, "/b", true).unwrap(), key);
+    }
+
+    #[test]
+    fn data_directory_has_one_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Secrets::open(dir.path(), Encryption::Plaintext).unwrap();
+        assert!(Secrets::open(dir.path(), Encryption::Plaintext).is_err());
+        drop(secrets);
+        Secrets::open(dir.path(), Encryption::Plaintext).unwrap();
     }
 
     #[test]

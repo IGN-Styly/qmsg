@@ -28,8 +28,9 @@ Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at
 `<data_dir>/qmsg.db` and encrypts them with XChaCha20-Poly1305 under a master
 key held in the OS keychain: Keychain on macOS, Credential Manager on Windows
-and Secret Service on Linux. Without a keychain, secrets are stored as plain
-text. `data_dir` defaults to `~/.qmsg`; the example config sets it to `.qmsg`
+and Secret Service on Linux. Each data directory has its own key, and only one
+orchestrator can use a data directory at a time. Without a keychain, secrets
+are stored as plain text. `data_dir` defaults to `~/.qmsg`; the example config sets it to `.qmsg`
 in the current directory.
 
 The example provider connects to a line-based TCP server, so start one first.
