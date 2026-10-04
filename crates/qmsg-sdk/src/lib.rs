@@ -18,15 +18,15 @@
 //! qmsg_sdk::export_provider!(MyProvider);
 //! ```
 
-use std::collections::VecDeque;
-use std::io;
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Read};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use qmsg_types::{
-    self as types, Channel, ChannelKind, ChannelRef, Command, Content, ContentKind,
-    DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageEvent, Organization,
-    ProviderConfig, User,
+    self as types, Channel, ChannelKind, ChannelRef, Command, CommandError, Content, ContentKind,
+    ContentRule, DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageEvent,
+    MessageLimits, Organization, ProviderConfig, Reply, User, Violation,
 };
 use qmsg_types::{HostMessage, ProviderMessage};
 use tungstenite::WebSocket;
@@ -57,6 +57,9 @@ pub struct Context {
     socket: WebSocket<TcpStream>,
     /// Commands that arrived while waiting for something else.
     pending: VecDeque<Command>,
+    /// Blobs answered without involving the provider, by id.
+    shared: HashMap<String, Vec<u8>>,
+    next_shared: u64,
 }
 
 impl Context {
@@ -79,6 +82,8 @@ impl Context {
             config,
             socket,
             pending: VecDeque::new(),
+            shared: HashMap::new(),
+            next_shared: 0,
         })
     }
 
@@ -109,10 +114,60 @@ impl Context {
         self.send(&ProviderMessage::Message(event.into()))
     }
 
-    /// Answers a [`Command::Send`] with the sent message's id, or why it
-    /// wasn't sent.
-    pub fn sent(&mut self, request: u64, result: std::result::Result<String, String>) -> Result {
-        self.send(&ProviderMessage::Sent { request, result })
+    /// Answers a [`Command`] by its `request`.
+    pub fn reply(
+        &mut self,
+        request: u64,
+        result: std::result::Result<Reply, CommandError>,
+    ) -> Result {
+        self.send(&ProviderMessage::Reply { request, result })
+    }
+
+    /// Makes `bytes` readable by the orchestrator as a [`MediaSource::Blob`],
+    /// returning its id. [`Context::next_command`] answers its reads, until
+    /// [`Context::unshare`].
+    ///
+    /// For files the provider has to fetch from the platform, use an id of
+    /// its own instead and answer [`Command::ReadBlob`] itself.
+    pub fn share(&mut self, bytes: Vec<u8>) -> String {
+        self.next_shared += 1;
+        let id = format!("shared-{}", self.next_shared);
+        self.shared.insert(id.clone(), bytes);
+        id
+    }
+
+    pub fn unshare(&mut self, id: &str) {
+        self.shared.remove(id);
+    }
+
+    /// Reads up to `len` bytes, at most [`types::MAX_READ`], of a blob the
+    /// orchestrator sent, starting at `offset`. Shorter than `len` only at
+    /// the end of the blob.
+    pub fn read_blob(&mut self, blob: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.send(&ProviderMessage::ReadBlob {
+            blob: blob.to_owned(),
+            offset,
+            len,
+        })?;
+        match self.answer()? {
+            HostMessage::Blob {
+                blob: b,
+                offset: o,
+                result,
+            } if b == blob && o == offset => Ok(result?),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Reads a blob the orchestrator sent from start to end, such as to
+    /// stream it into an upload.
+    pub fn blob_reader(&mut self, blob: impl Into<String>) -> BlobReader<'_> {
+        BlobReader {
+            cx: self,
+            blob: blob.into(),
+            offset: 0,
+            done: false,
+        }
     }
 
     /// Tells the orchestrator about a change to the organizations, users and
@@ -123,10 +178,46 @@ impl Context {
     }
 
     /// Waits for the next command, or returns `None` once `timeout` elapses.
+    ///
+    /// Reads of [shared](Context::share) blobs are answered here rather than
+    /// returned.
     pub fn next_command(&mut self, timeout: Option<Duration>) -> Result<Option<Command>> {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            let Some(command) = self.receive_command(deadline)? else {
+                return Ok(None);
+            };
+            match command {
+                Command::ReadBlob {
+                    request,
+                    blob,
+                    offset,
+                    len,
+                } if self.shared.contains_key(&blob) => {
+                    let bytes = &self.shared[&blob];
+                    let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
+                    let len = len.min(types::MAX_READ) as usize;
+                    let end = start + len.min(bytes.len() - start);
+                    let chunk = bytes[start..end].to_vec();
+                    self.reply(request, Ok(Reply::Blob(chunk)))?;
+                }
+                command => return Ok(Some(command)),
+            }
+        }
+    }
+
+    fn receive_command(&mut self, deadline: Option<Instant>) -> Result<Option<Command>> {
         if let Some(command) = self.pending.pop_front() {
             return Ok(Some(command));
         }
+        let timeout = match deadline {
+            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                // A zero timeout is an error for sockets.
+                Some(left) if !left.is_zero() => Some(left),
+                _ => return Ok(None),
+            },
+            None => None,
+        };
         self.set_read_timeout(timeout)?;
         let result = match self.receive() {
             Ok(HostMessage::Command(command)) => Ok(Some(command)),
@@ -145,7 +236,7 @@ impl Context {
     pub fn secret_get(&mut self, key: impl Into<String>) -> Result<Option<Vec<u8>>> {
         let key = key.into();
         self.send(&ProviderMessage::SecretGet { key: key.clone() })?;
-        match self.reply()? {
+        match self.answer()? {
             HostMessage::Secret { key: k, result } if k == key => Ok(result?),
             other => Err(unexpected(other)),
         }
@@ -170,14 +261,14 @@ impl Context {
     }
 
     fn secret_stored(&mut self, key: &str) -> Result {
-        match self.reply()? {
+        match self.answer()? {
             HostMessage::SecretStored { key: k, result } if k == key => Ok(result?),
             other => Err(unexpected(other)),
         }
     }
 
     /// Waits for the answer to a request, saving commands that arrive first.
-    fn reply(&mut self) -> Result<HostMessage> {
+    fn answer(&mut self) -> Result<HostMessage> {
         loop {
             match self.receive()? {
                 HostMessage::Command(command) => self.pending.push_back(command),
@@ -214,6 +305,38 @@ impl Context {
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result {
         Ok(self.socket.get_mut().set_read_timeout(timeout)?)
+    }
+}
+
+/// Reads a blob the orchestrator sent; see [`Context::blob_reader`].
+pub struct BlobReader<'a> {
+    cx: &'a mut Context,
+    blob: String,
+    offset: u64,
+    done: bool,
+}
+
+impl Read for BlobReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        let len = u32::try_from(buf.len())
+            .unwrap_or(u32::MAX)
+            .min(types::MAX_READ);
+        let chunk = self
+            .cx
+            .read_blob(&self.blob, self.offset, len)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if chunk.len() > len as usize {
+            return Err(io::Error::other(
+                "the orchestrator sent more than was asked",
+            ));
+        }
+        buf[..chunk.len()].copy_from_slice(&chunk);
+        self.offset += chunk.len() as u64;
+        self.done = chunk.len() < len as usize;
+        Ok(chunk.len())
     }
 }
 

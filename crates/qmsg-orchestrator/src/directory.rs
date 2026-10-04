@@ -235,10 +235,7 @@ mod tests {
     }
 
     fn channel(id: &str, kind: ChannelKind) -> Channel {
-        Channel {
-            accepted_content: vec![ContentKind::Text],
-            ..Channel::new(id, id, kind)
-        }
+        Channel::new(id, id, kind).accepting([ContentKind::Text])
     }
 
     fn organization() -> Organization {

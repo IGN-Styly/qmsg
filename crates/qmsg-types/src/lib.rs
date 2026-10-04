@@ -23,7 +23,13 @@
 
 use std::collections::BTreeMap;
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+mod limits;
+
+pub use limits::{ContentRule, MessageLimits, Violation, check};
 
 /// Checked against each provider when it is loaded.
 pub const ABI_VERSION: u32 = 3;
@@ -38,8 +44,12 @@ pub struct ProviderConfig {
 }
 
 /// Largest encoded message either side may send. Bigger ones are refused
-/// before they are sent, rather than dropping the connection.
+/// before they are sent, rather than dropping the connection. Send bigger
+/// files as a [`MediaSource::Blob`].
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// The most bytes one blob read returns.
+pub const MAX_READ: u32 = 4 * 1024 * 1024;
 
 /// Where a channel is: in an organization, or in the provider's standalone
 /// scope when `organization` is `None`.
@@ -132,15 +142,32 @@ pub struct Media {
     pub name: Option<String>,
     /// The MIME type, such as `image/png`, if known.
     pub mime: Option<String>,
+    /// The size in bytes, if known. Ignored for [`MediaSource::Bytes`].
+    pub size: Option<u64>,
     pub source: MediaSource,
+}
+
+impl Media {
+    /// The size in bytes, if known.
+    pub fn size(&self) -> Option<u64> {
+        match &self.source {
+            MediaSource::Bytes(bytes) => Some(bytes.len() as u64),
+            _ => self.size,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaSource {
     /// The file itself. The whole message must fit in [`MAX_FRAME`].
     Bytes(Vec<u8>),
-    /// Where the platform hosts the file.
+    /// Where the file can be downloaded without credentials.
     Url(String),
+    /// A file held by the side that sent the message: the provider in the
+    /// messages it emits, the orchestrator in its commands. The other side
+    /// reads it in pieces, so it can be any size. Use it too for files only
+    /// the provider can download, such as ones behind the platform's login.
+    Blob(String),
 }
 
 /// The kinds of [`Content`], used to say what a [`Channel`] accepts.
@@ -204,11 +231,10 @@ pub struct Channel {
     /// The ids of the users in the channel, or `None` when it is open to its
     /// whole organization or the platform doesn't say.
     pub members: Option<Vec<String>>,
-    /// What can be sent to the channel. Empty for channels that can't be
-    /// written to, such as a voice channel without text chat. Only a hint:
-    /// the platform can still refuse a message, such as for its size or the
-    /// account's permissions.
-    pub accepted_content: Vec<ContentKind>,
+    /// What can be sent to the channel, and how much. Empty for channels that
+    /// can't be written to, such as a voice channel without text chat.
+    pub accepted_content: Vec<ContentRule>,
+    pub limits: MessageLimits,
 }
 
 impl Channel {
@@ -222,14 +248,24 @@ impl Channel {
             position: None,
             members: None,
             accepted_content: Vec::new(),
+            limits: MessageLimits::default(),
         }
     }
 
-    /// Whether `content`'s kind is in [`Channel::accepted_content`].
-    pub fn accepts(&self, content: &Content) -> bool {
-        self.accepted_content
-            .iter()
-            .any(|kind| kind.matches(content))
+    /// Takes `kinds` with no limits.
+    pub fn accepting(self, kinds: impl IntoIterator<Item = ContentKind>) -> Self {
+        Self {
+            accepted_content: kinds.into_iter().map(ContentRule::new).collect(),
+            ..self
+        }
+    }
+
+    /// Checks a message against the channel's rules and limits.
+    ///
+    /// Passing is only a good sign: the platform can still refuse a message,
+    /// such as for the account's permissions.
+    pub fn check(&self, content: &[Content]) -> Result<(), Violation> {
+        check(&self.accepted_content, &self.limits, content)
     }
 }
 
@@ -287,19 +323,102 @@ pub enum DirectoryUpdate {
 }
 
 /// Work the orchestrator hands to a provider.
+///
+/// The provider answers each command but `Shutdown` with a
+/// [`ProviderMessage::Reply`] carrying the command's `request`, which the
+/// orchestrator chooses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
-    /// Sends a message. The provider answers with
-    /// [`ProviderMessage::Sent`], and reports the message itself as
-    /// [`MessageEvent::Received`] like any other.
+    /// Sends a message, answered with [`Reply::Sent`]. The provider also
+    /// reports the message as [`MessageEvent::Received`], like any other.
     Send {
-        /// Chosen by the orchestrator, to match the answer to the command.
         request: u64,
         channel: ChannelRef,
         reply_to: Option<String>,
         content: Vec<Content>,
     },
+    /// Opens a conversation with `members`, or finds the one already open,
+    /// answered with [`Reply::Opened`]. The provider reports the channel
+    /// before answering.
+    ///
+    /// Members are user ids in the organization's scope, or addresses the
+    /// provider hasn't reported, such as an email address or phone number.
+    OpenChannel {
+        request: u64,
+        organization: Option<String>,
+        members: Vec<String>,
+    },
+    /// Reads up to `len` bytes, at most [`MAX_READ`], of a
+    /// [`MediaSource::Blob`] the provider sent, starting at `offset`.
+    /// Answered with [`Reply::Blob`], which is shorter than `len` only at the
+    /// end of the blob.
+    ReadBlob {
+        request: u64,
+        blob: String,
+        offset: u64,
+        len: u32,
+    },
     Shutdown,
+}
+
+/// A provider's answer to a [`Command`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reply {
+    /// The id of the message that was sent.
+    Sent {
+        id: String,
+    },
+    Opened(ChannelRef),
+    Blob(Vec<u8>),
+}
+
+/// Why a provider couldn't carry out a [`Command`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandError {
+    /// The provider or platform can't do this.
+    Unsupported,
+    UnknownChannel(ChannelRef),
+    UnknownUser(String),
+    UnknownBlob(String),
+    /// The content breaks the channel's rules or limits.
+    Rejected(Violation),
+    /// Too many requests; try again after this many milliseconds, if the
+    /// platform says.
+    RateLimited {
+        retry_after_ms: Option<u64>,
+    },
+    /// The account isn't allowed to, such as post in an announcement channel.
+    Forbidden(String),
+    /// Anything else, as the provider describes it.
+    Failed(String),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => write!(f, "not supported"),
+            Self::UnknownChannel(channel) => write!(f, "unknown channel {channel:?}"),
+            Self::UnknownUser(id) => write!(f, "unknown user `{id}`"),
+            Self::UnknownBlob(id) => write!(f, "unknown blob `{id}`"),
+            Self::Rejected(violation) => write!(f, "rejected: {violation}"),
+            Self::RateLimited {
+                retry_after_ms: Some(ms),
+            } => write!(f, "rate limited, retry in {ms} ms"),
+            Self::RateLimited {
+                retry_after_ms: None,
+            } => write!(f, "rate limited"),
+            Self::Forbidden(reason) => write!(f, "forbidden: {reason}"),
+            Self::Failed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+impl From<Violation> for CommandError {
+    fn from(violation: Violation) -> Self {
+        Self::Rejected(violation)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,11 +456,18 @@ pub enum ProviderMessage {
     /// part of. Sent before any message in them, and again whenever they
     /// change.
     Directory(DirectoryUpdate),
-    /// The answer to a [`Command::Send`]: the sent message's id, or why it
-    /// wasn't sent.
-    Sent {
+    /// The answer to a [`Command`].
+    Reply {
         request: u64,
-        result: Result<String, String>,
+        result: Result<Reply, CommandError>,
+    },
+    /// Reads up to `len` bytes, at most [`MAX_READ`], of a
+    /// [`MediaSource::Blob`] the orchestrator sent, starting at `offset`.
+    /// Answered with [`HostMessage::Blob`].
+    ReadBlob {
+        blob: String,
+        offset: u64,
+        len: u32,
     },
 }
 
@@ -362,6 +488,13 @@ pub enum HostMessage {
     SecretStored {
         key: String,
         result: Result<(), String>,
+    },
+    /// The answer to a [`ProviderMessage::ReadBlob`]: shorter than asked only
+    /// at the end of the blob.
+    Blob {
+        blob: String,
+        offset: u64,
+        result: Result<Vec<u8>, String>,
     },
 }
 

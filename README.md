@@ -34,17 +34,32 @@ their workspace, so they go in its organization.
 
 Each channel has a kind (text, voice, video, announcement, forum, thread,
 category, direct, group, or a custom one), an optional parent channel and
-member list, and the content it accepts. A provider sends a whole organization
-when it joins, then upserts or removes single users and channels as they
-change. The orchestrator passes these on as `ProviderEvent::Directory`, and
+member list, and the content it accepts with that platform's limits: the
+largest text and files, the MIME types, and how many attachments and bytes a
+message can have. Providers report the limits that apply to the account, and
+`Channel::check` tells either side exactly how a message breaks them.
+
+A provider sends a whole organization when it joins, then upserts or removes
+single users and channels as they change. The orchestrator passes these on as `ProviderEvent::Directory`, and
 `Directory` keeps the current state for each provider.
 
 Messages have an id, a timestamp and an optional message they reply to. Their
 content is a list of parts, so one message can carry text, images, video,
 audio, files and custom content together. Providers emit new messages, edits
-and deletions, including the account's own messages. Each `Command::Send`
-carries a request number, and the provider answers it with the new message's
-id or an error.
+and deletions, including the account's own messages.
+
+The orchestrator commands a provider through `ProviderHandle`, whose methods
+wait for the answer: `send_message` returns the new message's id,
+`open_channel` opens or finds a conversation with some users, including ones
+the provider hasn't reported, such as an email address, and `read_blob` reads
+a file the provider sent. Failures say why, such as a limit the content
+breaks, a rate limit or a missing permission.
+
+Files of any size, or that only the provider can download, travel as blobs:
+the side that sends one keeps it, and the other reads it in pieces of up to
+4 MiB. The orchestrator offers files with `Orchestrator::add_blob`; providers
+read them with `Context::blob_reader` and offer their own with
+`Context::share`, or by answering `Command::ReadBlob` themselves.
 
 Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at

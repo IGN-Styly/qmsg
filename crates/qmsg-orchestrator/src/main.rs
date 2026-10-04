@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use qmsg_orchestrator::{Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec};
-use qmsg_types::{Command, Content, DirectoryUpdate, MessageEvent};
+use qmsg_types::{Content, DirectoryUpdate, MessageEvent};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -93,10 +93,6 @@ async fn main() -> anyhow::Result<()> {
                         tracing::warn!(provider, "ignored directory update: {e}");
                     }
                 }
-                ProviderEvent::Sent { provider, request, result } => match result {
-                    Ok(id) => tracing::debug!(provider, request, id, "sent"),
-                    Err(e) => tracing::warn!(provider, request, "send failed: {e}"),
-                },
                 ProviderEvent::Exited { provider, result } => {
                     running -= 1;
                     directory.remove_provider(&provider);
@@ -118,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("shutting down, press Ctrl-C again to kill");
                 shutting_down = true;
                 for handle in &handles {
-                    let _ = handle.send(Command::Shutdown);
+                    let _ = handle.shutdown();
                 }
             }
         }

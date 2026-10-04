@@ -5,10 +5,12 @@ use std::process::Command as Process;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use qmsg_orchestrator::{Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec};
+use qmsg_orchestrator::{
+    Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec, RequestError,
+};
 use qmsg_types::{
-    Channel, ChannelKind, ChannelRef, Command, Content, ContentKind, DirectoryUpdate, MAX_FRAME,
-    Media, MediaSource, Message, MessageEvent,
+    ChannelKind, ChannelRef, CommandError, Content, ContentKind, DirectoryUpdate, MAX_FRAME,
+    MAX_READ, Media, MediaSource, Message, MessageEvent, Violation,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -103,15 +105,6 @@ async fn received(events: &mut mpsc::Receiver<ProviderEvent>) -> Message {
     }
 }
 
-async fn sent(events: &mut mpsc::Receiver<ProviderEvent>) -> (u64, Result<String, String>) {
-    match next(events).await {
-        ProviderEvent::Sent {
-            request, result, ..
-        } => (request, result),
-        other => panic!("expected a send result, got {other:?}"),
-    }
-}
-
 async fn exited(events: &mut mpsc::Receiver<ProviderEvent>) -> Result<(), String> {
     match next(events).await {
         ProviderEvent::Exited { result, .. } => result,
@@ -129,13 +122,13 @@ fn home(port: u16) -> ChannelRef {
     ChannelRef::new(Some(&server), server.clone())
 }
 
-fn send(request: u64, channel: ChannelRef, content: Vec<Content>) -> Command {
-    Command::Send {
-        request,
-        channel,
-        reply_to: None,
-        content,
-    }
+fn file(name: &str, source: MediaSource) -> Content {
+    Content::File(Media {
+        name: Some(name.into()),
+        mime: None,
+        size: None,
+        source,
+    })
 }
 
 #[tokio::test]
@@ -154,21 +147,21 @@ async fn provider_reports_its_organization() {
     directory.apply(&provider, update).unwrap();
 
     let channel = directory.channel("echo", &home(port)).unwrap();
+    assert_eq!(channel.kind, ChannelKind::Text);
+    assert_eq!(channel.limits.max_attachments, Some(1));
     assert_eq!(
-        channel,
-        &Channel {
-            accepted_content: vec![ContentKind::Text],
-            ..Channel::new(&server, &server, ChannelKind::Text)
-        }
+        directory.scope("echo", Some(&server)).unwrap().me(),
+        Some("me")
     );
-    assert!(channel.accepts(&Content::Text("hi".into())));
-    assert!(!channel.accepts(&Content::Image(Media {
-        name: None,
-        mime: Some("image/png".into()),
-        source: MediaSource::Url("https://example.com/a.png".into()),
-    })));
-    let scope = directory.scope("echo", Some(&server)).unwrap();
-    assert_eq!(scope.me(), Some("me"));
+    // The orchestrator can check content against the channel's limits itself.
+    assert_eq!(channel.check(&text("hi")), Ok(()));
+    assert_eq!(
+        channel.check(&[Content::Text("x".repeat(2001))]),
+        Err(Violation::TextTooLong {
+            length: 2001,
+            max: 2000
+        })
+    );
 
     // The greeting comes from the organization's channel, by a known user.
     let greeting = received(&mut events).await;
@@ -186,10 +179,10 @@ async fn provider_owns_its_connection() {
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     started(&mut events).await;
 
-    provider.send(send(1, home(port), text("ping"))).unwrap();
-    let (request, result) = sent(&mut events).await;
-    assert_eq!(request, 1);
-    let id = result.unwrap();
+    let id = provider
+        .send_message(home(port), None, text("ping"))
+        .await
+        .unwrap();
     // The sent message is reported like any other, by the account.
     let mine = received(&mut events).await;
     assert_eq!(
@@ -212,14 +205,16 @@ async fn provider_owns_its_connection() {
 
     // Each line gets its own reply.
     let content = vec![Content::Text("a\r\nb".into()), Content::Text("c".into())];
-    provider.send(send(2, home(port), content)).unwrap();
-    assert_eq!(sent(&mut events).await.0, 2);
+    provider
+        .send_message(home(port), None, content)
+        .await
+        .unwrap();
     received(&mut events).await; // the sent message
     for expected in ["echo: a", "echo: b", "echo: c"] {
         assert_eq!(received(&mut events).await.content, text(expected));
     }
 
-    provider.send(Command::Shutdown).unwrap();
+    provider.shutdown().unwrap();
     // Sent right before the provider returns, so it must still beat `Exited`.
     assert_eq!(received(&mut events).await.content, text("goodbye"));
     assert_eq!(exited(&mut events).await, Ok(()));
@@ -233,33 +228,135 @@ async fn sends_the_channel_cannot_take_fail() {
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     started(&mut events).await;
 
-    // A channel the provider never reported.
     let elsewhere = ChannelRef::new(None, "general");
-    provider.send(send(1, elsewhere, text("ping"))).unwrap();
-    let (request, result) = sent(&mut events).await;
-    assert_eq!(request, 1);
-    assert!(result.is_err());
-
-    // Content the channel doesn't accept.
     let image = Content::Image(Media {
-        name: Some("cat.png".into()),
+        name: None,
         mime: Some("image/png".into()),
+        size: None,
         source: MediaSource::Bytes(vec![0x89, b'P', b'N', b'G']),
     });
-    provider
-        .send(send(
-            2,
+    let two_files = vec![
+        file("a", MediaSource::Bytes(vec![1])),
+        file("b", MediaSource::Bytes(vec![2])),
+    ];
+    let cases = [
+        (
+            elsewhere.clone(),
+            text("ping"),
+            CommandError::UnknownChannel(elsewhere),
+        ),
+        (
             home(port),
             vec![Content::Text("look".into()), image],
-        ))
-        .unwrap();
-    let (request, result) = sent(&mut events).await;
-    assert_eq!(request, 2);
-    assert!(result.is_err());
+            Violation::Unsupported {
+                part: 1,
+                kind: ContentKind::Image,
+            }
+            .into(),
+        ),
+        (
+            home(port),
+            two_files,
+            Violation::TooManyAttachments { count: 2, max: 1 }.into(),
+        ),
+        (
+            home(port),
+            vec![file("c", MediaSource::Url("https://example.com/c".into()))],
+            CommandError::Unsupported,
+        ),
+    ];
+    for (channel, content, error) in cases {
+        assert_eq!(
+            provider.send_message(channel, None, content).await,
+            Err(RequestError::Failed(error))
+        );
+    }
 
     // Nothing was sent, so the next event is the goodbye.
-    provider.send(Command::Shutdown).unwrap();
+    provider.shutdown().unwrap();
     assert_eq!(received(&mut events).await.content, text("goodbye"));
+}
+
+#[tokio::test]
+async fn blobs_are_read_in_pieces_both_ways() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    // Bigger than one read, so it takes several.
+    let bytes: Vec<u8> = (0..MAX_READ as usize + 1000).map(|i| i as u8).collect();
+    let blob = orchestrator.add_blob(bytes.clone()).unwrap();
+    let content = vec![Content::File(blob.media(Some("big.bin".into()), None))];
+    provider
+        .send_message(home(port), None, content)
+        .await
+        .unwrap();
+
+    // The provider holds its copy of the sent file.
+    let mine = received(&mut events).await;
+    let [Content::File(media)] = mine.content.as_slice() else {
+        panic!("expected a file, got {:?}", mine.content);
+    };
+    assert_eq!(media.size, Some(bytes.len() as u64));
+    let MediaSource::Blob(id) = &media.source else {
+        panic!("expected a blob, got {:?}", media.source);
+    };
+    let mut copy = Vec::new();
+    loop {
+        let piece = provider
+            .read_blob(id, copy.len() as u64, MAX_READ)
+            .await
+            .unwrap();
+        copy.extend_from_slice(&piece);
+        if piece.len() < MAX_READ as usize {
+            break;
+        }
+    }
+    assert_eq!(copy, bytes);
+
+    let reply = received(&mut events).await;
+    let expected = format!("echo: file big.bin: {} bytes", bytes.len());
+    assert_eq!(reply.content, text(&expected));
+
+    assert_eq!(
+        provider.read_blob("nope", 0, 10).await,
+        Err(RequestError::Failed(CommandError::UnknownBlob(
+            "nope".into()
+        )))
+    );
+    // A dropped blob can't be read any more.
+    drop(blob);
+    let content = vec![file("gone", MediaSource::Blob("gone".into()))];
+    assert!(matches!(
+        provider.send_message(home(port), None, content).await,
+        Err(RequestError::Failed(CommandError::Failed(_)))
+    ));
+}
+
+#[tokio::test]
+async fn opens_channels_with_known_users() {
+    let port = start_server().await;
+    let server = format!("127.0.0.1:{port}");
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let opened = provider
+        .open_channel(Some(server.clone()), vec![server.clone()])
+        .await;
+    assert_eq!(opened, Ok(home(port)));
+    let opened = provider
+        .open_channel(Some(server), vec!["bob".into()])
+        .await;
+    assert_eq!(
+        opened,
+        Err(RequestError::Failed(CommandError::UnknownUser(
+            "bob".into()
+        )))
+    );
 }
 
 #[tokio::test]
@@ -270,16 +367,15 @@ async fn commands_over_the_limit_are_refused() {
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     started(&mut events).await;
 
-    let huge = Content::File(Media {
-        name: None,
-        mime: None,
-        source: MediaSource::Bytes(vec![0; MAX_FRAME]),
-    });
-    assert!(provider.send(send(1, home(port), vec![huge])).is_err());
+    let huge = file("huge", MediaSource::Bytes(vec![0; MAX_FRAME]));
+    assert!(matches!(
+        provider.send_message(home(port), None, vec![huge]).await,
+        Err(RequestError::TooLarge { .. })
+    ));
 
     // The connection is still up.
-    provider.send(send(2, home(port), text("ping"))).unwrap();
-    assert_eq!(sent(&mut events).await, (2, Ok("2".into())));
+    let sent = provider.send_message(home(port), None, text("ping")).await;
+    assert_eq!(sent, Ok("2".into()));
 }
 
 #[tokio::test]
@@ -296,6 +392,9 @@ async fn kill_stops_a_blocked_provider() {
         .await
         .unwrap();
     assert!(closed.is_none());
+    // Requests fail rather than wait forever.
+    let sent = provider.send_message(home(port), None, text("ping")).await;
+    assert_eq!(sent, Err(RequestError::NotRunning));
 }
 
 #[tokio::test]

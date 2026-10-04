@@ -10,12 +10,18 @@
 //! Providers report the organizations, users and channels they are part of as
 //! [`ProviderEvent::Directory`]; [`Directory`] keeps track of them.
 //!
+//! Commands go through [`ProviderHandle`], whose methods wait for the
+//! provider's answer. Files too big for one message, in either direction, are
+//! [blobs](Blob) read in pieces.
+//!
 //! Providers' secrets live in a SQLite database in the data directory; see
 //! [`Encryption`] for how they are protected.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -23,12 +29,12 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use futures_util::{SinkExt, StreamExt};
 use qmsg_types::{
-    ABI_VERSION, Command, DirectoryUpdate, HostMessage, LogLevel, MAX_FRAME, MessageEvent,
-    ProviderConfig, ProviderMessage,
+    ABI_VERSION, ChannelRef, Command, CommandError, Content, DirectoryUpdate, HostMessage,
+    LogLevel, MAX_FRAME, MessageEvent, ProviderConfig, ProviderMessage, Reply,
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as Frame;
@@ -39,9 +45,12 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+mod blobs;
 mod directory;
 mod secrets;
 
+use blobs::Blobs;
+pub use blobs::{Blob, BlobSource, FileBlob};
 pub use directory::{ApplyError, Directory, OrganizationEntry, Scope};
 pub use secrets::Encryption;
 use secrets::Secrets;
@@ -83,12 +92,6 @@ pub enum ProviderEvent {
         provider: String,
         update: DirectoryUpdate,
     },
-    /// The answer to a [`Command::Send`].
-    Sent {
-        provider: String,
-        request: u64,
-        result: Result<String, String>,
-    },
     Exited {
         provider: String,
         result: Result<(), String>,
@@ -107,6 +110,8 @@ struct Session {
     /// Weak, so dropping the orchestrator releases the data directory even
     /// while providers are still running.
     secrets: Weak<Secrets>,
+    blobs: Weak<Blobs>,
+    requests: Arc<Requests>,
     /// Open connections, counted from the handshake until every frame the
     /// provider sent has been handled.
     connections: watch::Sender<usize>,
@@ -139,11 +144,66 @@ impl Drop for ConnectionGuard {
     }
 }
 
+type Answer = Result<Reply, CommandError>;
+
+/// Commands waiting for the provider's answer, shared by the session and the
+/// handle.
+#[derive(Default)]
+struct Requests {
+    next: AtomicU64,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
+}
+
+/// Forgets a request once it is answered or no longer awaited.
+struct PendingGuard<'a> {
+    requests: &'a Requests,
+    request: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.requests.pending.lock().unwrap().remove(&self.request);
+    }
+}
+
+/// Why a [`ProviderHandle`] request failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// The provider exited, or exited before answering.
+    NotRunning,
+    /// The command is over [`MAX_FRAME`] encoded. Send big files as a
+    /// [`Blob`] instead.
+    TooLarge { size: usize },
+    /// The provider couldn't carry out the command.
+    Failed(CommandError),
+    /// The provider answered with a reply for a different command.
+    UnexpectedReply(Reply),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => write!(f, "the provider is not running"),
+            Self::TooLarge { size } => {
+                write!(
+                    f,
+                    "the command is {size} bytes, over the {MAX_FRAME} byte limit"
+                )
+            }
+            Self::Failed(e) => write!(f, "{e}"),
+            Self::UnexpectedReply(reply) => write!(f, "unexpected reply {reply:?}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
 pub struct Orchestrator {
     engine: Engine,
     linker: Arc<Linker<WasiState>>,
     sessions: Sessions,
     secrets: Arc<Secrets>,
+    blobs: Arc<Blobs>,
     addr: SocketAddr,
     server: JoinHandle<()>,
 }
@@ -191,9 +251,16 @@ impl Orchestrator {
             linker: Arc::new(linker),
             sessions,
             secrets: Arc::new(secrets),
+            blobs: Arc::default(),
             addr,
             server,
         })
+    }
+
+    /// Offers `source` to providers, to send as a [`Blob::media`]. Providers
+    /// can read it until the returned [`Blob`] is dropped.
+    pub fn add_blob(&self, source: impl BlobSource) -> anyhow::Result<Blob> {
+        Ok(Blob::new(&self.blobs, new_token()?, source))
     }
 
     /// Starts a provider on its own thread.
@@ -223,8 +290,11 @@ impl Orchestrator {
             commands: tokio::sync::Mutex::new(commands_rx),
             events: events.clone(),
             secrets: Arc::downgrade(&self.secrets),
+            blobs: Arc::downgrade(&self.blobs),
+            requests: Arc::default(),
             connections: watch::Sender::new(0),
         });
+        let requests = session.requests.clone();
         sessions.insert(token.clone(), session.clone());
         drop(sessions);
 
@@ -258,6 +328,9 @@ impl Orchestrator {
                         // Handle what the provider sent before reporting the
                         // exit, so `Exited` is always its last event.
                         session.drained().await;
+                        // Fail new requests, then the ones still waiting.
+                        session.commands.lock().await.close();
+                        session.requests.pending.lock().unwrap().clear();
                         let permit = events.reserve().await;
                         // Freeing the name and sending `Exited` together means
                         // a new provider with this name can't send events
@@ -284,6 +357,7 @@ impl Orchestrator {
 
         Ok(ProviderHandle {
             commands: commands_tx,
+            requests,
             kill,
         })
     }
@@ -292,23 +366,106 @@ impl Orchestrator {
 /// Controls a running provider. Dropping it kills the provider.
 pub struct ProviderHandle {
     commands: mpsc::UnboundedSender<Vec<u8>>,
+    requests: Arc<Requests>,
     kill: Arc<Notify>,
 }
 
 impl ProviderHandle {
-    /// Queues a command. Fails if the provider has already exited, or if the
-    /// command is too big to send.
-    pub fn send(&self, command: Command) -> anyhow::Result<()> {
-        let bytes = qmsg_types::encode(&HostMessage::Command(command))?;
+    /// Sends a message, returning its id.
+    ///
+    /// Check the content with [`Channel::check`](qmsg_types::Channel::check)
+    /// first to learn of the channel's limits without asking the provider.
+    pub async fn send_message(
+        &self,
+        channel: ChannelRef,
+        reply_to: Option<String>,
+        content: Vec<Content>,
+    ) -> Result<String, RequestError> {
+        let reply = self
+            .request(|request| Command::Send {
+                request,
+                channel,
+                reply_to,
+                content,
+            })
+            .await?;
+        match reply {
+            Reply::Sent { id } => Ok(id),
+            other => Err(RequestError::UnexpectedReply(other)),
+        }
+    }
+
+    /// Opens a conversation with `members`, or finds the one already open.
+    /// The provider reports the channel before this returns.
+    pub async fn open_channel(
+        &self,
+        organization: Option<String>,
+        members: Vec<String>,
+    ) -> Result<ChannelRef, RequestError> {
+        let reply = self
+            .request(|request| Command::OpenChannel {
+                request,
+                organization,
+                members,
+            })
+            .await?;
+        match reply {
+            Reply::Opened(channel) => Ok(channel),
+            other => Err(RequestError::UnexpectedReply(other)),
+        }
+    }
+
+    /// Reads up to `len` bytes, at most [`MAX_READ`](qmsg_types::MAX_READ),
+    /// of a blob the provider sent, starting at `offset`. Shorter than `len`
+    /// only at the end of the blob.
+    pub async fn read_blob(
+        &self,
+        blob: &str,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, RequestError> {
+        let reply = self
+            .request(|request| Command::ReadBlob {
+                request,
+                blob: blob.to_owned(),
+                offset,
+                len,
+            })
+            .await?;
+        match reply {
+            Reply::Blob(bytes) => Ok(bytes),
+            other => Err(RequestError::UnexpectedReply(other)),
+        }
+    }
+
+    /// Asks the provider to stop. It exits when it is done.
+    pub fn shutdown(&self) -> Result<(), RequestError> {
+        self.queue(Command::Shutdown)
+    }
+
+    async fn request(&self, command: impl FnOnce(u64) -> Command) -> Result<Reply, RequestError> {
+        let request = self.requests.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.requests.pending.lock().unwrap().insert(request, tx);
+        let _guard = PendingGuard {
+            requests: &self.requests,
+            request,
+        };
+        self.queue(command(request))?;
+        rx.await
+            .map_err(|_| RequestError::NotRunning)?
+            .map_err(RequestError::Failed)
+    }
+
+    fn queue(&self, command: Command) -> Result<(), RequestError> {
+        let bytes =
+            qmsg_types::encode(&HostMessage::Command(command)).expect("commands always encode");
         if bytes.len() > MAX_FRAME {
-            bail!(
-                "command is {} bytes, over the {MAX_FRAME} byte limit",
-                bytes.len()
-            );
+            return Err(RequestError::TooLarge { size: bytes.len() });
         }
         self.commands
             .send(bytes)
-            .map_err(|_| anyhow::anyhow!("provider is not running"))
+            .map_err(|_| RequestError::NotRunning)
     }
 
     /// Stops the provider immediately, even if it is blocked on I/O.
@@ -493,7 +650,8 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
                         continue;
                     }
                 },
-                // Replies are small: secrets are limited far below `MAX_FRAME`.
+                // Replies are small: secrets and blob reads are limited far
+                // below `MAX_FRAME`.
                 reply = replies.recv() => match reply {
                     Some(reply) => qmsg_types::encode(&reply).expect("host messages always encode"),
                     None => break,
@@ -533,16 +691,24 @@ impl Session {
                     .await;
                 None
             }
-            ProviderMessage::Sent { request, result } => {
-                let _ = self
-                    .events
-                    .send(ProviderEvent::Sent {
-                        provider: self.name.clone(),
-                        request,
-                        result,
-                    })
-                    .await;
+            ProviderMessage::Reply { request, result } => {
+                let pending = self.requests.pending.lock().unwrap().remove(&request);
+                match pending {
+                    // The requester may have stopped waiting.
+                    Some(tx) => {
+                        let _ = tx.send(result);
+                    }
+                    None => tracing::debug!(provider = self.name, request, "unawaited reply"),
+                }
                 None
+            }
+            ProviderMessage::ReadBlob { blob, offset, len } => {
+                let result = blobs::read(&self.blobs, &blob, offset, len).await;
+                Some(HostMessage::Blob {
+                    blob,
+                    offset,
+                    result,
+                })
             }
             ProviderMessage::Directory(update) => {
                 let _ = self
