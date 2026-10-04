@@ -200,3 +200,17 @@ async fn running_providers_have_unique_names() {
     let _provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     next(&mut events).await;
 }
+
+#[tokio::test]
+async fn dropping_the_orchestrator_releases_the_data_directory() {
+    let port = start_server().await;
+    let (orchestrator, dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let _provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    next(&mut events).await; // greeting; the provider is still running
+
+    drop(orchestrator);
+    Orchestrator::new(dir.path(), Encryption::Plaintext)
+        .await
+        .unwrap();
+}

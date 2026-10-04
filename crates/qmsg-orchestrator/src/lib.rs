@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -81,7 +81,9 @@ struct Session {
     name: String,
     commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>,
     events: mpsc::Sender<ProviderEvent>,
-    secrets: Arc<Secrets>,
+    /// Weak, so dropping the orchestrator releases the data directory even
+    /// while providers are still running.
+    secrets: Weak<Secrets>,
     /// Open connections, counted from the handshake until every frame the
     /// provider sent has been handled.
     connections: watch::Sender<usize>,
@@ -194,7 +196,7 @@ impl Orchestrator {
             name: spec.name.clone(),
             commands: tokio::sync::Mutex::new(commands_rx),
             events: events.clone(),
-            secrets: self.secrets.clone(),
+            secrets: Arc::downgrade(&self.secrets),
             connections: watch::Sender::new(0),
         });
         sessions.insert(token.clone(), session.clone());
@@ -504,9 +506,12 @@ impl Session {
     async fn secret<T: Send + 'static>(
         &self,
         key: &str,
-        op: impl FnOnce(&Secrets, &str, &str) -> T + Send + 'static,
-    ) -> T {
-        let secrets = self.secrets.clone();
+        op: impl FnOnce(&Secrets, &str, &str) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let secrets = self
+            .secrets
+            .upgrade()
+            .ok_or("the orchestrator has shut down")?;
         let name = self.name.clone();
         let key = key.to_owned();
         tokio::task::spawn_blocking(move || op(&secrets, &name, &key))

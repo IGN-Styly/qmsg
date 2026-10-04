@@ -62,8 +62,11 @@ impl Secrets {
             // secrets as plain text, and a new key would orphan the old ones.
             // The lock means no one else can add encrypted rows meanwhile.
             let encrypted = secrets.has_encrypted()?;
-            let user = dir.to_string_lossy();
-            match keychain().and_then(|store| master_key(&*store, &user, !encrypted)) {
+            // Lossy conversion could give two directories the same key.
+            let user = dir
+                .to_str()
+                .with_context(|| format!("{} is not valid UTF-8", dir.display()))?;
+            match keychain().and_then(|store| master_key(&*store, user, !encrypted)) {
                 Ok(key) => secrets.cipher = Some(XChaCha20Poly1305::new(&key)),
                 Err(e) if encrypted => {
                     return Err(e.context("can't load the master key for the stored secrets"));
