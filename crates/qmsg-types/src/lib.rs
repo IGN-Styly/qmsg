@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Checked against each provider when it is loaded.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Passed to a provider when it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,17 +25,168 @@ pub struct ProviderConfig {
     pub settings: BTreeMap<String, String>,
 }
 
+/// A message sent to or received from a channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
-    pub chat: String,
+    /// The [`Organization`] the channel belongs to, or `None` for channels
+    /// outside any, such as direct messages.
+    pub organization: Option<String>,
+    pub channel: String,
+    /// The author's [`User`] id.
     pub author: String,
-    pub body: String,
+    /// The parts of the message, in order, such as a caption and its image.
+    pub content: Vec<Content>,
+}
+
+/// One part of a [`Message`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Content {
+    Text(String),
+    Image(Media),
+    Video(Media),
+    Audio(Media),
+    File(Media),
+    /// Anything else the platform has, such as a sticker or a poll, in a
+    /// format the provider defines.
+    Custom {
+        kind: String,
+        data: Vec<u8>,
+    },
+}
+
+impl Content {
+    pub fn kind(&self) -> ContentKind {
+        match self {
+            Self::Text(_) => ContentKind::Text,
+            Self::Image(_) => ContentKind::Image,
+            Self::Video(_) => ContentKind::Video,
+            Self::Audio(_) => ContentKind::Audio,
+            Self::File(_) => ContentKind::File,
+            Self::Custom { kind, .. } => ContentKind::Custom(kind.clone()),
+        }
+    }
+}
+
+/// A file carried by a [`Content`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Media {
+    /// The file name, if the platform has one.
+    pub name: Option<String>,
+    /// The MIME type, such as `image/png`, if known.
+    pub mime: Option<String>,
+    pub source: MediaSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaSource {
+    Bytes(Vec<u8>),
+    /// Where the platform hosts the file.
+    Url(String),
+}
+
+/// The kinds of [`Content`], used to say what a [`Channel`] accepts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ContentKind {
+    Text,
+    Image,
+    Video,
+    Audio,
+    File,
+    /// Matches [`Content::Custom`] with the same `kind`.
+    Custom(String),
+}
+
+/// A group on a platform, such as a Discord server or a Slack workspace.
+///
+/// Ids are chosen by the provider and only need to be unique within it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Organization {
+    pub id: String,
+    pub name: String,
+    pub users: Vec<User>,
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    /// Unique within the user's organization.
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channel {
+    /// Unique within the channel's organization, or among the provider's
+    /// channels outside any.
+    pub id: String,
+    pub name: String,
+    pub kind: ChannelKind,
+    /// What can be sent to the channel. Empty for channels that can't be
+    /// written to, such as a voice channel without text chat.
+    pub inputs: Vec<ContentKind>,
+}
+
+impl Channel {
+    /// Whether the channel takes `content`.
+    pub fn accepts(&self, content: &Content) -> bool {
+        self.inputs.contains(&content.kind())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelKind {
+    Text,
+    Voice,
+    Video,
+    /// Only some users can post, such as a news channel.
+    Announcement,
+    /// Holds threads rather than messages.
+    Forum,
+    /// A conversation between two users.
+    Direct,
+    /// A conversation between a few users, outside any channel list.
+    Group,
+    /// Anything else the platform has, named by the provider.
+    Custom(String),
+}
+
+/// A change to the organizations and channels a provider is part of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectoryUpdate {
+    /// Adds an organization, or replaces it along with its users and channels.
+    OrganizationSet(Organization),
+    OrganizationRemoved {
+        id: String,
+    },
+    /// Adds a user to an organization, or replaces the one with its id.
+    UserSet {
+        organization: String,
+        user: User,
+    },
+    UserRemoved {
+        organization: String,
+        id: String,
+    },
+    /// Adds a channel, or replaces the one with its id. Channels outside any
+    /// organization, such as direct messages, have no `organization`.
+    ChannelSet {
+        organization: Option<String>,
+        channel: Channel,
+    },
+    ChannelRemoved {
+        organization: Option<String>,
+        id: String,
+    },
 }
 
 /// Work the orchestrator hands to a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
-    Send { chat: String, body: String },
+    Send {
+        organization: Option<String>,
+        channel: String,
+        content: Vec<Content>,
+    },
     Shutdown,
 }
 
@@ -70,6 +221,9 @@ pub enum ProviderMessage {
     SecretDelete {
         key: String,
     },
+    /// A change to the organizations and channels the provider is part of.
+    /// Sent before any message in them, and again whenever they change.
+    Directory(DirectoryUpdate),
 }
 
 /// Sent from the orchestrator to a provider.

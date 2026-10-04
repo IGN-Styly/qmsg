@@ -7,6 +7,9 @@
 //! Providers talk to the orchestrator over a WebSocket. The orchestrator serves
 //! it on localhost and gives each provider a URL with its own session token.
 //!
+//! Providers report the organizations and channels they are part of as
+//! [`ProviderEvent::Directory`]; [`Directory`] keeps track of them.
+//!
 //! Providers' secrets live in a SQLite database in the data directory; see
 //! [`Encryption`] for how they are protected.
 
@@ -20,7 +23,8 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use futures_util::{SinkExt, StreamExt};
 use qmsg_types::{
-    ABI_VERSION, Command, HostMessage, LogLevel, Message, ProviderConfig, ProviderMessage,
+    ABI_VERSION, Command, DirectoryUpdate, HostMessage, LogLevel, Message, ProviderConfig,
+    ProviderMessage,
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
@@ -33,8 +37,10 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+mod directory;
 mod secrets;
 
+pub use directory::Directory;
 pub use secrets::Encryption;
 use secrets::Secrets;
 
@@ -66,6 +72,11 @@ pub enum ProviderEvent {
     Message {
         provider: String,
         message: Message,
+    },
+    /// A change to the organizations and channels the provider is part of.
+    Directory {
+        provider: String,
+        update: DirectoryUpdate,
     },
     Exited {
         provider: String,
@@ -480,6 +491,16 @@ impl Session {
                     .send(ProviderEvent::Message {
                         provider: self.name.clone(),
                         message,
+                    })
+                    .await;
+                None
+            }
+            ProviderMessage::Directory(update) => {
+                let _ = self
+                    .events
+                    .send(ProviderEvent::Directory {
+                        provider: self.name.clone(),
+                        update,
                     })
                     .await;
                 None

@@ -23,7 +23,10 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
-pub use qmsg_types::{self as types, Command, LogLevel, Message, ProviderConfig};
+pub use qmsg_types::{
+    self as types, Channel, ChannelKind, Command, Content, ContentKind, DirectoryUpdate, LogLevel,
+    Media, MediaSource, Message, Organization, ProviderConfig, User,
+};
 use qmsg_types::{HostMessage, ProviderMessage};
 use tungstenite::{WebSocket, protocol::Message as Frame};
 
@@ -94,6 +97,13 @@ impl Context {
     /// Hands a message received from the platform to the orchestrator.
     pub fn emit(&mut self, message: Message) -> Result {
         self.send(&ProviderMessage::Emit(message))
+    }
+
+    /// Tells the orchestrator about a change to the organizations and channels
+    /// the provider is part of, including direct messages outside any
+    /// organization. Report a channel before emitting messages from it.
+    pub fn directory(&mut self, update: DirectoryUpdate) -> Result {
+        self.send(&ProviderMessage::Directory(update))
     }
 
     /// Waits for the next command, or returns `None` once `timeout` elapses.

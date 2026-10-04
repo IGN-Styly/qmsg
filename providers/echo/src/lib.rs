@@ -1,13 +1,17 @@
 //! Example provider that talks a line-based protocol over TCP.
 //!
-//! It connects to the `server` setting, emits the server's greeting, then for
-//! each `Send` command writes each line of the body and emits each reply. On
-//! `Shutdown` it emits a goodbye and returns.
+//! It connects to the `server` setting and reports the server as an
+//! organization with one text channel, named after the server. It then emits
+//! the server's greeting, and for each `Send` command writes each line of the
+//! text and emits each reply. On `Shutdown` it emits a goodbye and returns.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 
-use qmsg_sdk::{Command, Context, LogLevel, Message, Provider, Result};
+use qmsg_sdk::{
+    Channel, ChannelKind, Command, Content, ContentKind, Context, DirectoryUpdate, LogLevel,
+    Message, Organization, Provider, Result, User,
+};
 
 struct Echo;
 
@@ -17,34 +21,54 @@ impl Provider for Echo {
         let mut conn = BufReader::new(TcpStream::connect(&server)?);
         cx.log(LogLevel::Info, format!("connected to {server}"));
 
-        let greeting = read_line(&mut conn)?;
-        cx.emit(Message {
-            chat: server.clone(),
+        cx.directory(DirectoryUpdate::OrganizationSet(Organization {
+            id: server.clone(),
+            name: server.clone(),
+            users: vec![User {
+                id: server.clone(),
+                name: server.clone(),
+            }],
+            channels: vec![Channel {
+                id: server.clone(),
+                name: server.clone(),
+                kind: ChannelKind::Text,
+                inputs: vec![ContentKind::Text],
+            }],
+        }))?;
+        let message = |channel: &str, text: String| Message {
+            organization: Some(server.clone()),
+            channel: channel.to_owned(),
             author: server.clone(),
-            body: greeting,
-        })?;
+            content: vec![Content::Text(text)],
+        };
+
+        let greeting = read_line(&mut conn)?;
+        cx.emit(message(&server, greeting))?;
 
         while let Some(command) = cx.next_command(None)? {
             match command {
                 // The server answers each line, so send the lines one at a
-                // time to keep every reply with its command's chat.
-                Command::Send { chat, body } => {
-                    for line in body.split('\n') {
-                        writeln!(conn.get_mut(), "{line}")?;
-                        let reply = read_line(&mut conn)?;
-                        cx.emit(Message {
-                            chat: chat.clone(),
-                            author: server.clone(),
-                            body: reply,
-                        })?;
+                // time to keep every reply with its command's channel.
+                Command::Send {
+                    channel, content, ..
+                } => {
+                    for part in content {
+                        let Content::Text(text) = part else {
+                            cx.log(
+                                LogLevel::Warn,
+                                format!("can't send {:?} to a line server", part.kind()),
+                            );
+                            continue;
+                        };
+                        for line in text.split('\n') {
+                            writeln!(conn.get_mut(), "{line}")?;
+                            let reply = read_line(&mut conn)?;
+                            cx.emit(message(&channel, reply))?;
+                        }
                     }
                 }
                 Command::Shutdown => {
-                    cx.emit(Message {
-                        chat: server.clone(),
-                        author: server.clone(),
-                        body: "goodbye".into(),
-                    })?;
+                    cx.emit(message(&server, "goodbye".into()))?;
                     break;
                 }
             }

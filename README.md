@@ -24,6 +24,18 @@ Change the types instead. New enum variants go at the end; any other change,
 including adding a field, needs an `ABI_VERSION` bump, because postcard can't
 decode a layout it doesn't know.
 
+Providers report the organizations they are part of, such as Discord servers
+or Slack workspaces, with `Context::directory`. An organization holds users
+and channels. Channels can also stand alone, outside any organization, for
+direct and group messages. Each channel has a kind (text, voice, video, announcement, forum,
+direct, group, or a custom one) and lists the content it accepts as inputs.
+Message content is a list of parts, so one message can carry text, images,
+video, audio, files and custom content together. A provider sends a whole
+organization when it joins, then updates single users and channels as they
+change. The orchestrator passes these on as `ProviderEvent::Directory`, and
+`Directory` keeps the current state of each provider's organizations and
+channels.
+
 Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at
 `<data_dir>/qmsg.db` and encrypts them with XChaCha20-Poly1305 under a master

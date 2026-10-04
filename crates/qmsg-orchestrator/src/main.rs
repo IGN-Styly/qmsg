@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use qmsg_orchestrator::{Encryption, Orchestrator, ProviderEvent, ProviderSpec};
-use qmsg_types::Command;
+use qmsg_orchestrator::{Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec};
+use qmsg_types::{Command, Content, DirectoryUpdate};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -48,16 +48,39 @@ async fn main() -> anyhow::Result<()> {
     }
     drop(events_tx);
 
+    let mut directory = Directory::new();
     let mut running = handles.len();
     let mut shutting_down = false;
     while running > 0 {
         tokio::select! {
             Some(event) = events.recv() => match event {
                 ProviderEvent::Message { provider, message } => {
-                    tracing::info!(provider, chat = message.chat, author = message.author, "{}", message.body);
+                    let organization = message.organization.as_deref().unwrap_or("-");
+                    tracing::info!(
+                        provider,
+                        organization,
+                        channel = message.channel,
+                        author = message.author,
+                        "{}",
+                        describe(&message.content),
+                    );
+                }
+                ProviderEvent::Directory { provider, update } => {
+                    if let DirectoryUpdate::OrganizationSet(organization) = &update {
+                        tracing::info!(
+                            provider,
+                            organization = organization.id,
+                            users = organization.users.len(),
+                            channels = organization.channels.len(),
+                            "joined {}",
+                            organization.name,
+                        );
+                    }
+                    directory.apply(&provider, update);
                 }
                 ProviderEvent::Exited { provider, result } => {
                     running -= 1;
+                    directory.remove_provider(&provider);
                     match result {
                         Ok(()) => tracing::info!(provider, "exited"),
                         Err(e) => tracing::error!(provider, "exited: {e}"),
@@ -82,4 +105,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Message content as one line, with attachments in brackets.
+fn describe(content: &[Content]) -> String {
+    let parts: Vec<String> = content
+        .iter()
+        .map(|part| match part {
+            Content::Text(text) => text.clone(),
+            Content::Image(_) => "[image]".into(),
+            Content::Video(_) => "[video]".into(),
+            Content::Audio(_) => "[audio]".into(),
+            Content::File(_) => "[file]".into(),
+            Content::Custom { kind, .. } => format!("[{kind}]"),
+        })
+        .collect();
+    parts.join(" ")
 }
