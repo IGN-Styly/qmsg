@@ -112,24 +112,40 @@ impl Context {
         result
     }
 
-    pub fn kv_get(&mut self, key: impl Into<String>) -> Result<Option<Vec<u8>>> {
+    /// Reads a secret, or `None` if it was never set.
+    ///
+    /// Secrets are kept by the orchestrator, encrypted with a key from the
+    /// OS keychain when one is available. Each provider sees only its own.
+    pub fn secret_get(&mut self, key: impl Into<String>) -> Result<Option<Vec<u8>>> {
         let key = key.into();
-        self.send(&ProviderMessage::KvGet { key: key.clone() })?;
+        self.send(&ProviderMessage::SecretGet { key: key.clone() })?;
         match self.reply()? {
-            HostMessage::Value { key: k, value } if k == key => Ok(value),
+            HostMessage::Secret { key: k, result } if k == key => Ok(result?),
             other => Err(unexpected(other)),
         }
     }
 
-    /// Stores a value. Fails if it doesn't fit in the provider's KV storage.
-    pub fn kv_set(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Result {
+    /// Stores a secret. Fails if it doesn't fit in the provider's secret
+    /// storage.
+    pub fn secret_set(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Result {
         let key = key.into();
-        self.send(&ProviderMessage::KvSet {
+        self.send(&ProviderMessage::SecretSet {
             key: key.clone(),
             value: value.into(),
         })?;
+        self.secret_stored(&key)
+    }
+
+    /// Removes a secret. Removing one that isn't set is not an error.
+    pub fn secret_delete(&mut self, key: impl Into<String>) -> Result {
+        let key = key.into();
+        self.send(&ProviderMessage::SecretDelete { key: key.clone() })?;
+        self.secret_stored(&key)
+    }
+
+    fn secret_stored(&mut self, key: &str) -> Result {
         match self.reply()? {
-            HostMessage::Stored { key: k, result } if k == key => Ok(result?),
+            HostMessage::SecretStored { key: k, result } if k == key => Ok(result?),
             other => Err(unexpected(other)),
         }
     }

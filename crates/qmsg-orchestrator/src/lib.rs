@@ -6,10 +6,13 @@
 //!
 //! Providers talk to the orchestrator over a WebSocket. The orchestrator serves
 //! it on localhost and gives each provider a URL with its own session token.
+//!
+//! Providers' secrets live in a SQLite database in the data directory; see
+//! [`Encryption`] for how they are protected.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -27,8 +30,13 @@ use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+
+mod secrets;
+
+pub use secrets::Encryption;
+use secrets::Secrets;
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -40,10 +48,6 @@ mod bindings {
 
 /// How often running providers are made to yield to the executor.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
-const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-/// Total key and value bytes a provider may keep in KV storage. It lives in
-/// the orchestrator's memory, outside the provider's `MEMORY_LIMIT`.
-const KV_LIMIT: usize = 16 * 1024 * 1024;
 /// Replies waiting to be written to a provider. A provider that keeps asking
 /// without reading only stalls its own connection.
 const REPLY_QUEUE: usize = 64;
@@ -77,7 +81,7 @@ struct Session {
     name: String,
     commands: tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>,
     events: mpsc::Sender<ProviderEvent>,
-    kv: Mutex<Kv>,
+    secrets: Arc<Secrets>,
     /// Open connections, counted from the handshake until every frame the
     /// provider sent has been handled.
     connections: watch::Sender<usize>,
@@ -92,13 +96,6 @@ impl Session {
         let mut connections = self.connections.subscribe();
         let _ = connections.wait_for(|&n| n == 0).await;
     }
-}
-
-#[derive(Default)]
-struct Kv {
-    values: HashMap<String, Vec<u8>>,
-    /// Key and value bytes stored, checked against `KV_LIMIT`.
-    bytes: usize,
 }
 
 /// Counts one connection for as long as it is alive.
@@ -121,6 +118,7 @@ pub struct Orchestrator {
     engine: Engine,
     linker: Arc<Linker<WasiState>>,
     sessions: Sessions,
+    secrets: Arc<Secrets>,
     addr: SocketAddr,
     server: JoinHandle<()>,
 }
@@ -134,7 +132,14 @@ impl Drop for Orchestrator {
 
 impl Orchestrator {
     /// Creates the engine and starts the WebSocket server on localhost.
-    pub async fn new() -> anyhow::Result<Self> {
+    ///
+    /// Secrets are kept in `data_dir`, which is created if needed.
+    pub async fn new(data_dir: &Path, encryption: Encryption) -> anyhow::Result<Self> {
+        let data_dir = data_dir.to_owned();
+        // Opening may wait on the OS keychain.
+        let secrets =
+            tokio::task::spawn_blocking(move || Secrets::open(&data_dir, encryption)).await??;
+
         let mut config = Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
@@ -160,6 +165,7 @@ impl Orchestrator {
             engine,
             linker: Arc::new(linker),
             sessions,
+            secrets: Arc::new(secrets),
             addr,
             server,
         })
@@ -182,7 +188,7 @@ impl Orchestrator {
             name: spec.name.clone(),
             commands: tokio::sync::Mutex::new(commands_rx),
             events: events.clone(),
-            kv: Mutex::default(),
+            secrets: self.secrets.clone(),
             connections: watch::Sender::new(0),
         });
         self.sessions
@@ -292,14 +298,8 @@ async fn run(
     let state = WasiState {
         wasi: wasi_ctx(),
         table: ResourceTable::new(),
-        limits: StoreLimitsBuilder::new()
-            .memory_size(MEMORY_LIMIT)
-            // `memory_size` applies to each memory, so allow only one.
-            .memories(1)
-            .build(),
     };
     let mut store = Store::new(&engine, state);
-    store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Yield(1)));
 
@@ -319,7 +319,6 @@ async fn run(
 struct WasiState {
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
 }
 
 impl WasiView for WasiState {
@@ -479,24 +478,36 @@ impl Session {
                     .await;
                 None
             }
-            ProviderMessage::KvGet { key } => {
-                let value = self.kv.lock().unwrap().values.get(&key).cloned();
-                Some(HostMessage::Value { key, value })
+            ProviderMessage::SecretGet { key } => {
+                let result = self.secret(&key, |s, name, key| s.get(name, key)).await;
+                Some(HostMessage::Secret { key, result })
             }
-            ProviderMessage::KvSet { key, value } => {
-                let mut kv = self.kv.lock().unwrap();
-                let old = kv.values.get(&key).map_or(0, |v| key.len() + v.len());
-                let bytes = kv.bytes - old + key.len() + value.len();
-                let result = if bytes > KV_LIMIT {
-                    Err(format!("KV storage is limited to {KV_LIMIT} bytes"))
-                } else {
-                    kv.bytes = bytes;
-                    kv.values.insert(key.clone(), value);
-                    Ok(())
-                };
-                Some(HostMessage::Stored { key, result })
+            ProviderMessage::SecretSet { key, value } => {
+                let result = self
+                    .secret(&key, move |s, name, key| s.set(name, key, &value))
+                    .await;
+                Some(HostMessage::SecretStored { key, result })
+            }
+            ProviderMessage::SecretDelete { key } => {
+                let result = self.secret(&key, |s, name, key| s.delete(name, key)).await;
+                Some(HostMessage::SecretStored { key, result })
             }
         }
+    }
+
+    /// Runs a secret storage operation off the async threads, since SQLite
+    /// blocks.
+    async fn secret<T: Send + 'static>(
+        &self,
+        key: &str,
+        op: impl FnOnce(&Secrets, &str, &str) -> T + Send + 'static,
+    ) -> T {
+        let secrets = self.secrets.clone();
+        let name = self.name.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || op(&secrets, &name, &key))
+            .await
+            .expect("secret storage panicked")
     }
 }
 

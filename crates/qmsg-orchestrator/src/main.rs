@@ -1,13 +1,16 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use qmsg_orchestrator::{Orchestrator, ProviderEvent, ProviderSpec};
+use qmsg_orchestrator::{Encryption, Orchestrator, ProviderEvent, ProviderSpec};
 use qmsg_types::Command;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
 #[derive(Deserialize)]
 struct Config {
+    /// Where secrets are kept. Defaults to `~/.qmsg`; relative paths are from
+    /// the current directory.
+    data_dir: Option<PathBuf>,
     #[serde(default, rename = "provider")]
     providers: Vec<ProviderSpec>,
 }
@@ -31,7 +34,13 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("reading {}", path.display()))?,
     )?;
 
-    let orchestrator = Orchestrator::new().await?;
+    let data_dir = match config.data_dir {
+        Some(dir) => dir,
+        None => std::env::home_dir()
+            .context("no home directory, set `data_dir` in the config")?
+            .join(".qmsg"),
+    };
+    let orchestrator = Orchestrator::new(&data_dir, Encryption::Keychain).await?;
     let (events_tx, mut events) = mpsc::channel(256);
     let mut handles = Vec::new();
     for spec in config.providers {

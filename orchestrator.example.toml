@@ -1,5 +1,9 @@
 # Copy to orchestrator.toml and run `cargo run -p qmsg-orchestrator`.
 
+# Where secrets are kept. Defaults to ~/.qmsg; during development keep them in
+# the current directory instead.
+data_dir = ".qmsg"
+
 [[provider]]
 name = "echo"
 wasm = "target/wasm32-wasip2/debug/qmsg_provider_echo.wasm"

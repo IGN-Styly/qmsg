@@ -5,9 +5,12 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+chacha20poly1305 = "0.11"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4"
+keyring-core = "1.0"
 qmsg-types.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde.workspace = true
 tokio = { version = "1.53", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.30"
@@ -16,3 +19,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wasmtime = "49"
 wasmtime-wasi = "49"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"

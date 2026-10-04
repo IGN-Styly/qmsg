@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Checked against each provider when it is loaded.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Passed to a provider when it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,14 +57,18 @@ pub enum ProviderMessage {
     },
     /// A message received from the platform.
     Emit(Message),
-    /// Answered with [`HostMessage::Value`].
-    KvGet {
+    /// Answered with [`HostMessage::Secret`].
+    SecretGet {
         key: String,
     },
-    /// Answered with [`HostMessage::Stored`].
-    KvSet {
+    /// Answered with [`HostMessage::SecretStored`].
+    SecretSet {
         key: String,
         value: Vec<u8>,
+    },
+    /// Answered with [`HostMessage::SecretStored`].
+    SecretDelete {
+        key: String,
     },
 }
 
@@ -72,14 +76,17 @@ pub enum ProviderMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostMessage {
     Command(Command),
-    /// The answer to a [`ProviderMessage::KvGet`].
-    Value {
+    /// The answer to a [`ProviderMessage::SecretGet`]. Fails when the
+    /// secret can't be read or decrypted, which is not the same as it
+    /// never having been set.
+    Secret {
         key: String,
-        value: Option<Vec<u8>>,
+        result: Result<Option<Vec<u8>>, String>,
     },
-    /// The answer to a [`ProviderMessage::KvSet`]. Fails when the value
-    /// doesn't fit in the provider's KV storage.
-    Stored {
+    /// The answer to a [`ProviderMessage::SecretSet`] or
+    /// [`ProviderMessage::SecretDelete`]. A set fails when the value doesn't
+    /// fit in the provider's secret storage.
+    SecretStored {
         key: String,
         result: Result<(), String>,
     },

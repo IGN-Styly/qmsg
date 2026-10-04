@@ -5,7 +5,7 @@ use std::process::Command as Process;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use qmsg_orchestrator::{Orchestrator, ProviderEvent, ProviderSpec};
+use qmsg_orchestrator::{Encryption, Orchestrator, ProviderEvent, ProviderSpec};
 use qmsg_types::{Command, Message};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -65,6 +65,16 @@ fn spec(port: u16) -> ProviderSpec {
     }
 }
 
+/// An orchestrator with its own data directory, which lives as long as it does.
+async fn orchestrator() -> (Orchestrator, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    // Tests must not touch the real OS keychain.
+    let orchestrator = Orchestrator::new(dir.path(), Encryption::Plaintext)
+        .await
+        .unwrap();
+    (orchestrator, dir)
+}
+
 async fn next(events: &mut mpsc::Receiver<ProviderEvent>) -> ProviderEvent {
     timeout(Duration::from_secs(30), events.recv())
         .await
@@ -75,7 +85,7 @@ async fn next(events: &mut mpsc::Receiver<ProviderEvent>) -> ProviderEvent {
 #[tokio::test]
 async fn provider_owns_its_connection() {
     let port = start_server().await;
-    let orchestrator = Orchestrator::new().await.unwrap();
+    let (orchestrator, _dir) = orchestrator().await;
     let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
 
@@ -142,7 +152,7 @@ async fn provider_owns_its_connection() {
 #[tokio::test]
 async fn kill_stops_a_blocked_provider() {
     let port = start_server().await;
-    let orchestrator = Orchestrator::new().await.unwrap();
+    let (orchestrator, _dir) = orchestrator().await;
     let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     next(&mut events).await; // greeting; the provider now waits for commands
@@ -158,7 +168,7 @@ async fn kill_stops_a_blocked_provider() {
 #[tokio::test]
 async fn dropping_the_handle_stops_the_provider() {
     let port = start_server().await;
-    let orchestrator = Orchestrator::new().await.unwrap();
+    let (orchestrator, _dir) = orchestrator().await;
     let (events_tx, mut events) = mpsc::channel(16);
     let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
     next(&mut events).await; // greeting; the provider now waits for commands
