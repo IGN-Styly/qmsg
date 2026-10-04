@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 pub use qmsg_types::{
     self as types, Channel, ChannelKind, ChannelRef, Command, CommandError, Content, ContentKind,
     ContentRule, DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageEvent,
-    MessageLimits, Organization, ProviderConfig, Reply, User, Violation,
+    MessageLimits, Organization, ProviderConfig, Reply, TextUnit, User, Violation,
 };
 use qmsg_types::{HostMessage, ProviderMessage};
 use tungstenite::WebSocket;
@@ -57,9 +57,53 @@ pub struct Context {
     socket: WebSocket<TcpStream>,
     /// Commands that arrived while waiting for something else.
     pending: VecDeque<Command>,
-    /// Blobs answered without involving the provider, by id.
-    shared: HashMap<String, Vec<u8>>,
-    next_shared: u64,
+    shared: Shared,
+}
+
+/// Blobs answered without involving the provider.
+#[derive(Default)]
+struct Shared {
+    blobs: HashMap<String, Vec<u8>>,
+    /// Ids, oldest first.
+    order: VecDeque<String>,
+    bytes: usize,
+    limit: usize,
+    next: u64,
+}
+
+/// The default for [`Context::set_share_limit`].
+pub const SHARE_LIMIT: usize = 256 * 1024 * 1024;
+
+impl Shared {
+    fn insert(&mut self, bytes: Vec<u8>) -> String {
+        self.next += 1;
+        let id = format!("shared-{}", self.next);
+        self.bytes += bytes.len();
+        self.blobs.insert(id.clone(), bytes);
+        self.order.push_back(id.clone());
+        self.trim();
+        id
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        let Some(bytes) = self.blobs.remove(id) else {
+            return false;
+        };
+        self.bytes -= bytes.len();
+        self.order.retain(|other| other != id);
+        true
+    }
+
+    /// Drops the oldest blobs until they fit the limit.
+    fn trim(&mut self) {
+        while self.bytes > self.limit
+            && let Some(id) = self.order.pop_front()
+        {
+            if let Some(bytes) = self.blobs.remove(&id) {
+                self.bytes -= bytes.len();
+            }
+        }
+    }
 }
 
 impl Context {
@@ -82,8 +126,10 @@ impl Context {
             config,
             socket,
             pending: VecDeque::new(),
-            shared: HashMap::new(),
-            next_shared: 0,
+            shared: Shared {
+                limit: SHARE_LIMIT,
+                ..Shared::default()
+            },
         })
     }
 
@@ -124,26 +170,32 @@ impl Context {
     }
 
     /// Makes `bytes` readable by the orchestrator as a [`MediaSource::Blob`],
-    /// returning its id. [`Context::next_command`] answers its reads, until
-    /// [`Context::unshare`].
+    /// returning its id. [`Context::next_command`] answers its reads until the
+    /// orchestrator releases it, [`Context::unshare`] is called, or it is the
+    /// oldest when shared blobs go over [`Context::set_share_limit`].
     ///
     /// For files the provider has to fetch from the platform, use an id of
     /// its own instead and answer [`Command::ReadBlob`] itself.
     pub fn share(&mut self, bytes: Vec<u8>) -> String {
-        self.next_shared += 1;
-        let id = format!("shared-{}", self.next_shared);
-        self.shared.insert(id.clone(), bytes);
-        id
+        self.shared.insert(bytes)
     }
 
     pub fn unshare(&mut self, id: &str) {
         self.shared.remove(id);
     }
 
+    /// How many bytes shared blobs may hold together, [`SHARE_LIMIT`] by
+    /// default. The oldest are dropped to make room.
+    pub fn set_share_limit(&mut self, bytes: usize) {
+        self.shared.limit = bytes;
+        self.shared.trim();
+    }
+
     /// Reads up to `len` bytes, at most [`types::MAX_READ`], of a blob the
     /// orchestrator sent, starting at `offset`. Shorter than `len` only at
     /// the end of the blob.
     pub fn read_blob(&mut self, blob: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+        check_id(blob)?;
         self.send(&ProviderMessage::ReadBlob {
             blob: blob.to_owned(),
             offset,
@@ -179,8 +231,8 @@ impl Context {
 
     /// Waits for the next command, or returns `None` once `timeout` elapses.
     ///
-    /// Reads of [shared](Context::share) blobs are answered here rather than
-    /// returned.
+    /// Reads and releases of [shared](Context::share) blobs are handled here
+    /// rather than returned.
     pub fn next_command(&mut self, timeout: Option<Duration>) -> Result<Option<Command>> {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
@@ -193,14 +245,15 @@ impl Context {
                     blob,
                     offset,
                     len,
-                } if self.shared.contains_key(&blob) => {
-                    let bytes = &self.shared[&blob];
+                } if self.shared.blobs.contains_key(&blob) => {
+                    let bytes = &self.shared.blobs[&blob];
                     let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
                     let len = len.min(types::MAX_READ) as usize;
                     let end = start + len.min(bytes.len() - start);
                     let chunk = bytes[start..end].to_vec();
                     self.reply(request, Ok(Reply::Blob(chunk)))?;
                 }
+                Command::ReleaseBlob { blob } if self.shared.remove(&blob) => {}
                 command => return Ok(Some(command)),
             }
         }
@@ -235,6 +288,7 @@ impl Context {
     /// OS keychain when one is available. Each provider sees only its own.
     pub fn secret_get(&mut self, key: impl Into<String>) -> Result<Option<Vec<u8>>> {
         let key = key.into();
+        check_id(&key)?;
         self.send(&ProviderMessage::SecretGet { key: key.clone() })?;
         match self.answer()? {
             HostMessage::Secret { key: k, result } if k == key => Ok(result?),
@@ -246,6 +300,7 @@ impl Context {
     /// storage.
     pub fn secret_set(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Result {
         let key = key.into();
+        check_id(&key)?;
         self.send(&ProviderMessage::SecretSet {
             key: key.clone(),
             value: value.into(),
@@ -256,6 +311,7 @@ impl Context {
     /// Removes a secret. Removing one that isn't set is not an error.
     pub fn secret_delete(&mut self, key: impl Into<String>) -> Result {
         let key = key.into();
+        check_id(&key)?;
         self.send(&ProviderMessage::SecretDelete { key: key.clone() })?;
         self.secret_stored(&key)
     }
@@ -340,6 +396,19 @@ impl Read for BlobReader<'_> {
     }
 }
 
+/// The orchestrator disconnects providers that send longer ids.
+fn check_id(id: &str) -> Result {
+    if id.len() > types::MAX_ID {
+        return Err(format!(
+            "`{}…` is over {} bytes",
+            &id[..id.floor_char_boundary(32)],
+            types::MAX_ID
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn is_timeout(error: &Error) -> bool {
     matches!(
         error.downcast_ref::<tungstenite::Error>(),
@@ -378,4 +447,136 @@ macro_rules! export_provider {
 
         $crate::bindings::__export_provider_world!(__QmsgProvider with_types_in $crate::bindings);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+
+    /// Connects a context to a server running `script` on its own thread.
+    fn connect(
+        script: impl FnOnce(WebSocket<TcpStream>) + Send + 'static,
+    ) -> (Context, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            script(tungstenite::accept(stream).unwrap());
+        });
+        let config = ProviderConfig {
+            name: "test".into(),
+            host_url: format!("ws://{addr}/token"),
+            settings: Default::default(),
+        };
+        (Context::connect(config).unwrap(), server)
+    }
+
+    fn command(socket: &mut WebSocket<TcpStream>, command: Command) {
+        let bytes = types::encode(&HostMessage::Command(command)).unwrap();
+        socket.send(Frame::Binary(bytes.into())).unwrap();
+    }
+
+    fn blob_reply(socket: &mut WebSocket<TcpStream>) -> (u64, Vec<u8>) {
+        loop {
+            if let Frame::Binary(bytes) = socket.read().unwrap() {
+                match types::decode(&bytes).unwrap() {
+                    ProviderMessage::Reply {
+                        request,
+                        result: Ok(Reply::Blob(bytes)),
+                    } => return (request, bytes),
+                    other => panic!("expected a blob, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_command_times_out() {
+        let (mut cx, server) = connect(|mut socket| {
+            // Holds the connection open until the provider closes it.
+            while socket.read().is_ok() {}
+        });
+        let started = Instant::now();
+        assert!(
+            cx.next_command(Some(Duration::from_millis(50)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        drop(cx);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_blobs_are_answered_until_released() {
+        let bytes: Vec<u8> = (0..types::MAX_READ as usize + 10)
+            .map(|i| i as u8)
+            .collect();
+        let expected = bytes.clone();
+        let (mut cx, server) = connect(move |mut socket| {
+            let read = |request, offset, len| Command::ReadBlob {
+                request,
+                blob: "shared-1".into(),
+                offset,
+                len,
+            };
+            // Asking for more than `MAX_READ` gets `MAX_READ`.
+            command(&mut socket, read(1, 0, u32::MAX));
+            assert_eq!(
+                blob_reply(&mut socket),
+                (1, expected[..types::MAX_READ as usize].to_vec())
+            );
+            command(&mut socket, read(2, types::MAX_READ as u64, u32::MAX));
+            assert_eq!(
+                blob_reply(&mut socket),
+                (2, expected[types::MAX_READ as usize..].to_vec())
+            );
+            // Past the end is empty, not an error.
+            command(&mut socket, read(3, u64::MAX, 10));
+            assert_eq!(blob_reply(&mut socket), (3, Vec::new()));
+            // Once released, reads go to the provider.
+            command(
+                &mut socket,
+                Command::ReleaseBlob {
+                    blob: "shared-1".into(),
+                },
+            );
+            command(&mut socket, read(4, 0, 10));
+            while socket.read().is_ok() {}
+        });
+        assert_eq!(cx.share(bytes), "shared-1");
+        let next = cx.next_command(Some(Duration::from_secs(10))).unwrap();
+        assert!(
+            matches!(next, Some(Command::ReadBlob { request: 4, .. })),
+            "{next:?}"
+        );
+        drop(cx);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn the_oldest_shared_blobs_make_room() {
+        let mut shared = Shared {
+            limit: 10,
+            ..Shared::default()
+        };
+        let a = shared.insert(vec![0; 6]);
+        let b = shared.insert(vec![0; 4]);
+        let c = shared.insert(vec![0; 6]);
+        assert!(!shared.blobs.contains_key(&a));
+        assert!(shared.blobs.contains_key(&b) && shared.blobs.contains_key(&c));
+        assert_eq!(shared.bytes, 10);
+        assert!(shared.remove(&b));
+        assert!(!shared.remove(&b));
+        assert_eq!((shared.bytes, shared.order.len()), (6, 1));
+    }
+
+    #[test]
+    fn long_ids_are_refused_before_sending() {
+        assert!(check_id(&"é".repeat(types::MAX_ID)).is_err());
+        assert!(check_id(&"a".repeat(types::MAX_ID)).is_ok());
+    }
 }

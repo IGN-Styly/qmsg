@@ -14,6 +14,9 @@
 //! provider's answer. Files too big for one message, in either direction, are
 //! [blobs](Blob) read in pieces.
 //!
+//! Each provider gets one connection. A provider that sends an id or key
+//! over [`MAX_ID`] bytes, or a message that doesn't decode, is disconnected.
+//!
 //! Providers' secrets live in a SQLite database in the data directory; see
 //! [`Encryption`] for how they are protected.
 
@@ -30,11 +33,11 @@ use anyhow::{Context as _, bail};
 use futures_util::{SinkExt, StreamExt};
 use qmsg_types::{
     ABI_VERSION, ChannelRef, Command, CommandError, Content, DirectoryUpdate, HostMessage,
-    LogLevel, MAX_FRAME, MessageEvent, ProviderConfig, ProviderMessage, Reply,
+    LogLevel, MAX_FRAME, MAX_ID, MAX_READ, MessageEvent, ProviderConfig, ProviderMessage, Reply,
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as Frame;
@@ -66,8 +69,12 @@ mod bindings {
 /// How often running providers are made to yield to the executor.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Replies waiting to be written to a provider. A provider that keeps asking
-/// without reading only stalls its own connection.
-const REPLY_QUEUE: usize = 64;
+/// without reading only stalls its own connection. Each can be a blob read of
+/// up to `MAX_READ` bytes, so this bounds what a provider can make the
+/// orchestrator hold.
+const REPLY_QUEUE: usize = 4;
+/// How long [`ProviderHandle`] requests wait for an answer by default.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A provider to run.
 #[derive(Debug, Clone, Deserialize)]
@@ -111,9 +118,13 @@ struct Session {
     /// while providers are still running.
     secrets: Weak<Secrets>,
     blobs: Weak<Blobs>,
+    /// Identifies this provider's blobs.
+    token: String,
     requests: Arc<Requests>,
+    /// Set once the provider is killed.
+    killed: watch::Receiver<bool>,
     /// Open connections, counted from the handshake until every frame the
-    /// provider sent has been handled.
+    /// provider sent has been handled. At most one.
     connections: watch::Sender<usize>,
 }
 
@@ -126,15 +137,34 @@ impl Session {
         let mut connections = self.connections.subscribe();
         let _ = connections.wait_for(|&n| n == 0).await;
     }
+
+    /// Sends an event, unless the provider is killed first: then its events
+    /// are dropped, so a full channel can't keep it from exiting.
+    async fn forward(&self, event: ProviderEvent) {
+        let mut killed = self.killed.clone();
+        tokio::select! {
+            // Checked first, so nothing more is sent once it is set.
+            biased;
+            _ = killed.wait_for(|&k| k) => {}
+            _ = self.events.send(event) => {}
+        }
+    }
 }
 
-/// Counts one connection for as long as it is alive.
+/// Counts the provider's connection for as long as it is alive.
 struct ConnectionGuard(Arc<Session>);
 
 impl ConnectionGuard {
-    fn new(session: Arc<Session>) -> Self {
-        session.connections.send_modify(|n| *n += 1);
-        Self(session)
+    /// Fails if the provider already has a connection.
+    fn new(session: Arc<Session>) -> Option<Self> {
+        let first = session.connections.send_if_modified(|n| {
+            let first = *n == 0;
+            if first {
+                *n += 1;
+            }
+            first
+        });
+        first.then_some(Self(session))
     }
 }
 
@@ -174,10 +204,13 @@ pub enum RequestError {
     /// The command is over [`MAX_FRAME`] encoded. Send big files as a
     /// [`Blob`] instead.
     TooLarge { size: usize },
+    /// The provider didn't answer in time. It may still carry out the
+    /// command.
+    TimedOut,
     /// The provider couldn't carry out the command.
     Failed(CommandError),
-    /// The provider answered with a reply for a different command.
-    UnexpectedReply(Reply),
+    /// The provider's answer doesn't fit the command.
+    BadReply(String),
 }
 
 impl fmt::Display for RequestError {
@@ -190,8 +223,9 @@ impl fmt::Display for RequestError {
                     "the command is {size} bytes, over the {MAX_FRAME} byte limit"
                 )
             }
+            Self::TimedOut => write!(f, "the provider didn't answer in time"),
             Self::Failed(e) => write!(f, "{e}"),
-            Self::UnexpectedReply(reply) => write!(f, "unexpected reply {reply:?}"),
+            Self::BadReply(reason) => write!(f, "bad reply: {reason}"),
         }
     }
 }
@@ -257,27 +291,29 @@ impl Orchestrator {
         })
     }
 
-    /// Offers `source` to providers, to send as a [`Blob::media`]. Providers
-    /// can read it until the returned [`Blob`] is dropped.
-    pub fn add_blob(&self, source: impl BlobSource) -> anyhow::Result<Blob> {
-        Ok(Blob::new(&self.blobs, new_token()?, source))
-    }
-
     /// Starts a provider on its own thread.
     ///
     /// Events from the provider, including its exit, are sent to `events`.
     /// When `events` is full the provider's messages wait, which in turn
-    /// slows the provider down.
-    /// Failing to load the Wasm is reported as an `Exited` event.
+    /// slows the provider down. Don't wait on a request on the task that
+    /// receives the events without a timeout: the answer can be queued behind
+    /// events waiting for room.
     ///
-    /// Fails if a provider with the same name hasn't delivered its `Exited`
-    /// yet.
+    /// Failing to load the Wasm is reported as an `Exited` event. Fails if a
+    /// provider with the same name hasn't delivered its `Exited` yet.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
         events: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<ProviderHandle> {
         let token = new_token()?;
+        // Built here so a failure is an error rather than an exit, which
+        // couldn't keep its ordering.
+        let runtime = ProviderRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        ));
         let mut sessions = self.sessions.lock().unwrap();
         // Secrets are keyed by name, so two running providers with the same
         // name would share them.
@@ -285,92 +321,133 @@ impl Orchestrator {
             bail!("a provider named `{}` is already running", spec.name);
         }
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (kill, killed) = watch::channel(false);
         let session = Arc::new(Session {
             name: spec.name.clone(),
             commands: tokio::sync::Mutex::new(commands_rx),
             events: events.clone(),
             secrets: Arc::downgrade(&self.secrets),
             blobs: Arc::downgrade(&self.blobs),
+            token: token.clone(),
             requests: Arc::default(),
+            killed: killed.clone(),
             connections: watch::Sender::new(0),
         });
-        let requests = session.requests.clone();
+        let handle = ProviderHandle {
+            commands: commands_tx,
+            requests: session.requests.clone(),
+            blobs: Arc::downgrade(&self.blobs),
+            token: token.clone(),
+            timeout: Some(REQUEST_TIMEOUT),
+            kill,
+        };
         sessions.insert(token.clone(), session.clone());
         drop(sessions);
 
-        let kill = Arc::new(Notify::new());
-        let killed = kill.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
         let sessions = self.sessions.clone();
         let host_url = format!("ws://{}/{token}", self.addr);
         let name = spec.name.clone();
         let session_token = token.clone();
+        let mut killed = killed;
 
         let spawned = thread::Builder::new()
             .name(format!("provider-{}", spec.name))
             .spawn(move || {
-                let exited = |result: anyhow::Result<()>| ProviderEvent::Exited {
-                    provider: name,
-                    result: result.map_err(|e| format!("{e:#}")),
-                };
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(async {
-                        // Losing the race drops the provider's store, which
-                        // closes its sockets.
-                        let result = tokio::select! {
-                            result = run(engine, &linker, spec, host_url) => result,
-                            () = killed.notified() => Err(anyhow::anyhow!("killed")),
-                        };
-                        // Handle what the provider sent before reporting the
-                        // exit, so `Exited` is always its last event.
-                        session.drained().await;
-                        // Fail new requests, then the ones still waiting.
-                        session.commands.lock().await.close();
-                        session.requests.pending.lock().unwrap().clear();
-                        let permit = events.reserve().await;
-                        // Freeing the name and sending `Exited` together means
-                        // a new provider with this name can't send events
-                        // first, and can be spawned as soon as `Exited` is
-                        // received.
-                        let mut sessions = sessions.lock().unwrap();
-                        sessions.remove(&token);
-                        if let Ok(permit) = permit {
-                            permit.send(exited(result));
-                        }
-                    }),
-                    Err(e) => {
-                        // The provider never ran, so it sent no other events.
-                        sessions.lock().unwrap().remove(&token);
-                        let _ = events.blocking_send(exited(Err(e.into())));
+                runtime.block_on(async {
+                    // Losing the race drops the provider's store, which
+                    // closes its sockets.
+                    let result = tokio::select! {
+                        result = run(engine, &linker, spec, host_url) => result,
+                        _ = killed.wait_for(|&k| k) => Err(anyhow::anyhow!("killed")),
+                    };
+                    // Handle what the provider sent before reporting the
+                    // exit, so `Exited` is always its last event.
+                    session.drained().await;
+                    // Fail new requests, then the ones still waiting.
+                    session.commands.lock().await.close();
+                    session.requests.pending.lock().unwrap().clear();
+                    let permit = events.reserve().await;
+                    // Freeing the name and sending `Exited` together means a
+                    // new provider with this name can't send events first,
+                    // and can be spawned as soon as `Exited` is received.
+                    let mut sessions = sessions.lock().unwrap();
+                    sessions.remove(&token);
+                    if let Ok(permit) = permit {
+                        permit.send(ProviderEvent::Exited {
+                            provider: name,
+                            result: result.map_err(|e| format!("{e:#}")),
+                        });
                     }
-                }
+                })
             });
         if let Err(e) = spawned {
             // The thread never started, so nothing else will remove the session.
             self.sessions.lock().unwrap().remove(&session_token);
             return Err(e.into());
         }
+        Ok(handle)
+    }
+}
 
-        Ok(ProviderHandle {
-            commands: commands_tx,
-            requests,
-            kill,
-        })
+/// The runtime a provider's thread runs on.
+struct ProviderRuntime(Option<tokio::runtime::Runtime>);
+
+impl ProviderRuntime {
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.0
+            .as_ref()
+            .expect("only taken on drop")
+            .block_on(future)
+    }
+}
+
+impl Drop for ProviderRuntime {
+    /// A runtime can't be dropped normally in async code, which is where
+    /// `spawn` drops it when it fails.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
 /// Controls a running provider. Dropping it kills the provider.
+///
+/// Requests wait for the provider's answer, for [`REQUEST_TIMEOUT`] by
+/// default. A command can still be carried out after its request is dropped
+/// or times out, such as a message being sent.
 pub struct ProviderHandle {
     commands: mpsc::UnboundedSender<Vec<u8>>,
     requests: Arc<Requests>,
-    kill: Arc<Notify>,
+    blobs: Weak<Blobs>,
+    /// The session's token, which owns its blobs.
+    token: String,
+    timeout: Option<Duration>,
+    kill: watch::Sender<bool>,
 }
 
 impl ProviderHandle {
+    /// How long requests wait for an answer, or `None` to wait until the
+    /// provider exits.
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+
+    /// Offers `source` to this provider, to send as a [`Blob::media`]. It can
+    /// read it until the returned [`Blob`] is dropped.
+    ///
+    /// To send the same file to several providers, add an `Arc` of it to
+    /// each.
+    pub fn add_blob(&self, source: impl BlobSource) -> anyhow::Result<Blob> {
+        let blobs = self
+            .blobs
+            .upgrade()
+            .context("the orchestrator has shut down")?;
+        Ok(Blob::new(&blobs, new_token()?, self.token.clone(), source))
+    }
+
     /// Sends a message, returning its id.
     ///
     /// Check the content with [`Channel::check`](qmsg_types::Channel::check)
@@ -391,12 +468,15 @@ impl ProviderHandle {
             .await?;
         match reply {
             Reply::Sent { id } => Ok(id),
-            other => Err(RequestError::UnexpectedReply(other)),
+            other => Err(bad_reply(other)),
         }
     }
 
     /// Opens a conversation with `members`, or finds the one already open.
-    /// The provider reports the channel before this returns.
+    ///
+    /// The provider reports the channel first, so its
+    /// [`ProviderEvent::Directory`] is queued before this returns, though the
+    /// task receiving events may not have handled it yet.
     pub async fn open_channel(
         &self,
         organization: Option<String>,
@@ -411,7 +491,7 @@ impl ProviderHandle {
             .await?;
         match reply {
             Reply::Opened(channel) => Ok(channel),
-            other => Err(RequestError::UnexpectedReply(other)),
+            other => Err(bad_reply(other)),
         }
     }
 
@@ -433,9 +513,20 @@ impl ProviderHandle {
             })
             .await?;
         match reply {
-            Reply::Blob(bytes) => Ok(bytes),
-            other => Err(RequestError::UnexpectedReply(other)),
+            Reply::Blob(bytes) if bytes.len() <= len.min(MAX_READ) as usize => Ok(bytes),
+            Reply::Blob(bytes) => Err(RequestError::BadReply(format!(
+                "{} bytes for a read of {len}",
+                bytes.len()
+            ))),
+            other => Err(bad_reply(other)),
         }
+    }
+
+    /// Tells the provider the orchestrator is done with a blob it sent.
+    pub fn release_blob(&self, blob: &str) -> Result<(), RequestError> {
+        self.queue(Command::ReleaseBlob {
+            blob: blob.to_owned(),
+        })
     }
 
     /// Asks the provider to stop. It exits when it is done.
@@ -452,7 +543,13 @@ impl ProviderHandle {
             request,
         };
         self.queue(command(request))?;
-        rx.await
+        let answer = match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| RequestError::TimedOut)?,
+            None => rx.await,
+        };
+        answer
             .map_err(|_| RequestError::NotRunning)?
             .map_err(RequestError::Failed)
     }
@@ -470,9 +567,10 @@ impl ProviderHandle {
 
     /// Stops the provider immediately, even if it is blocked on I/O.
     ///
-    /// Its `Exited` event fails with `killed`.
+    /// Its `Exited` event fails with `killed`. Events it sent that are still
+    /// waiting for room in the channel are dropped.
     pub fn kill(&self) {
-        self.kill.notify_one();
+        self.kill.send_replace(true);
     }
 }
 
@@ -543,6 +641,15 @@ fn wasi_ctx() -> WasiCtx {
         .build()
 }
 
+fn bad_reply(reply: Reply) -> RequestError {
+    let kind = match reply {
+        Reply::Sent { .. } => "Sent",
+        Reply::Opened(_) => "Opened",
+        Reply::Blob(_) => "Blob",
+    };
+    RequestError::BadReply(format!("unexpected {kind}"))
+}
+
 fn new_token() -> anyhow::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating session token: {e}"))?;
@@ -582,7 +689,7 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
             .unwrap()
             .get(token)
             .cloned()
-            .map(ConnectionGuard::new);
+            .and_then(ConnectionGuard::new);
         match guard {
             Some(_) => Ok(response),
             None => Err(not_found()),
@@ -608,6 +715,10 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
         while let Some(frame) = stream.next().await {
             match frame {
                 Ok(Frame::Binary(bytes)) => match qmsg_types::decode(&bytes) {
+                    Ok(message) if has_long_id(&message) => {
+                        tracing::warn!(provider = session.name, "id over {MAX_ID} bytes");
+                        break;
+                    }
                     Ok(message) => {
                         if let Some(reply) = session.handle(message).await
                             && replies_tx.send(reply).await.is_err()
@@ -650,8 +761,8 @@ async fn connection(stream: TcpStream, sessions: Sessions) {
                         continue;
                     }
                 },
-                // Replies are small: secrets and blob reads are limited far
-                // below `MAX_FRAME`.
+                // Replies are small: secrets, blob reads and the ids they
+                // repeat are all limited far below `MAX_FRAME`.
                 reply = replies.recv() => match reply {
                     Some(reply) => qmsg_types::encode(&reply).expect("host messages always encode"),
                     None => break,
@@ -682,13 +793,11 @@ impl Session {
                 None
             }
             ProviderMessage::Message(event) => {
-                let _ = self
-                    .events
-                    .send(ProviderEvent::Message {
-                        provider: self.name.clone(),
-                        event,
-                    })
-                    .await;
+                self.forward(ProviderEvent::Message {
+                    provider: self.name.clone(),
+                    event,
+                })
+                .await;
                 None
             }
             ProviderMessage::Reply { request, result } => {
@@ -703,7 +812,12 @@ impl Session {
                 None
             }
             ProviderMessage::ReadBlob { blob, offset, len } => {
-                let result = blobs::read(&self.blobs, &blob, offset, len).await;
+                // A slow source mustn't keep a killed provider from exiting.
+                let mut killed = self.killed.clone();
+                let result = tokio::select! {
+                    result = blobs::read(&self.blobs, &self.token, &blob, offset, len) => result,
+                    _ = killed.wait_for(|&k| k) => Err("killed".into()),
+                };
                 Some(HostMessage::Blob {
                     blob,
                     offset,
@@ -711,13 +825,11 @@ impl Session {
                 })
             }
             ProviderMessage::Directory(update) => {
-                let _ = self
-                    .events
-                    .send(ProviderEvent::Directory {
-                        provider: self.name.clone(),
-                        update,
-                    })
-                    .await;
+                self.forward(ProviderEvent::Directory {
+                    provider: self.name.clone(),
+                    update,
+                })
+                .await;
                 None
             }
             ProviderMessage::SecretGet { key } => {
@@ -754,6 +866,19 @@ impl Session {
             .await
             .expect("secret storage panicked")
     }
+}
+
+/// Whether the message has an id or key the orchestrator would repeat back
+/// that is over [`MAX_ID`] bytes.
+fn has_long_id(message: &ProviderMessage) -> bool {
+    let id = match message {
+        ProviderMessage::SecretGet { key }
+        | ProviderMessage::SecretSet { key, .. }
+        | ProviderMessage::SecretDelete { key } => key,
+        ProviderMessage::ReadBlob { blob, .. } => blob,
+        _ => return false,
+    };
+    id.len() > MAX_ID
 }
 
 fn not_found() -> ErrorResponse {

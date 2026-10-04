@@ -1,12 +1,13 @@
 //! Runs the echo provider against a local TCP server.
 
+use std::io;
 use std::path::PathBuf;
 use std::process::Command as Process;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::time::Duration;
 
 use qmsg_orchestrator::{
-    Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec, RequestError,
+    BlobSource, Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec, RequestError,
 };
 use qmsg_types::{
     ChannelKind, ChannelRef, CommandError, Content, ContentKind, DirectoryUpdate, MAX_FRAME,
@@ -63,8 +64,12 @@ async fn start_server() -> u16 {
 }
 
 fn spec(port: u16) -> ProviderSpec {
+    named("echo", port)
+}
+
+fn named(name: &str, port: u16) -> ProviderSpec {
     ProviderSpec {
-        name: "echo".into(),
+        name: name.into(),
         wasm: echo_wasm().clone(),
         settings: [("server".to_owned(), format!("127.0.0.1:{port}"))].into(),
     }
@@ -80,8 +85,9 @@ async fn orchestrator() -> (Orchestrator, tempfile::TempDir) {
     (orchestrator, dir)
 }
 
+/// Long, since every test compiles the provider at once.
 async fn next(events: &mut mpsc::Receiver<ProviderEvent>) -> ProviderEvent {
-    timeout(Duration::from_secs(30), events.recv())
+    timeout(Duration::from_secs(120), events.recv())
         .await
         .expect("timed out waiting for provider event")
         .expect("event channel closed")
@@ -287,7 +293,7 @@ async fn blobs_are_read_in_pieces_both_ways() {
 
     // Bigger than one read, so it takes several.
     let bytes: Vec<u8> = (0..MAX_READ as usize + 1000).map(|i| i as u8).collect();
-    let blob = orchestrator.add_blob(bytes.clone()).unwrap();
+    let blob = provider.add_blob(bytes.clone()).unwrap();
     let content = vec![Content::File(blob.media(Some("big.bin".into()), None))];
     provider
         .send_message(home(port), None, content)
@@ -320,19 +326,144 @@ async fn blobs_are_read_in_pieces_both_ways() {
     let expected = format!("echo: file big.bin: {} bytes", bytes.len());
     assert_eq!(reply.content, text(&expected));
 
+    // Once released, the provider frees its copy.
+    provider.release_blob(id).unwrap();
     assert_eq!(
-        provider.read_blob("nope", 0, 10).await,
-        Err(RequestError::Failed(CommandError::UnknownBlob(
-            "nope".into()
-        )))
+        provider.read_blob(id, 0, 10).await,
+        Err(RequestError::Failed(CommandError::UnknownBlob(id.clone())))
     );
+
     // A dropped blob can't be read any more.
+    let gone = blob.id().to_owned();
     drop(blob);
-    let content = vec![file("gone", MediaSource::Blob("gone".into()))];
+    let content = vec![file("gone", MediaSource::Blob(gone))];
     assert!(matches!(
         provider.send_message(home(port), None, content).await,
         Err(RequestError::Failed(CommandError::Failed(_)))
     ));
+}
+
+#[tokio::test]
+async fn providers_only_read_their_own_blobs() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let a = orchestrator
+        .spawn(named("a", port), events_tx.clone())
+        .unwrap();
+    started(&mut events).await;
+    let b = orchestrator.spawn(named("b", port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let blob = a.add_blob(vec![1, 2, 3]).unwrap();
+    let content = vec![Content::File(blob.media(None, None))];
+    assert!(matches!(
+        b.send_message(home(port), None, content.clone()).await,
+        Err(RequestError::Failed(CommandError::Failed(_)))
+    ));
+    a.send_message(home(port), None, content).await.unwrap();
+}
+
+#[tokio::test]
+async fn files_over_the_limit_are_refused_by_the_provider() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    // Without a size, the channel's limits can't catch it; the provider
+    // finds out while reading it.
+    let max = 16 * 1024 * 1024;
+    let blob = provider.add_blob(vec![0u8; max + 1]).unwrap();
+    let content = vec![
+        Content::Text("big".into()),
+        Content::File(Media {
+            size: None,
+            ..blob.media(None, None)
+        }),
+    ];
+    assert_eq!(
+        provider.send_message(home(port), None, content).await,
+        Err(RequestError::Failed(
+            Violation::TooLarge {
+                part: 1,
+                size: max as u64 + 1,
+                max: max as u64,
+            }
+            .into()
+        ))
+    );
+}
+
+/// A blob source whose reads wait until the sender is dropped.
+struct Stall(Mutex<std_mpsc::Receiver<()>>);
+
+impl BlobSource for Stall {
+    fn size(&self) -> u64 {
+        1
+    }
+
+    fn read_at(&self, _: u64, _: usize) -> io::Result<Vec<u8>> {
+        let _ = self.0.lock().unwrap().recv();
+        Ok(vec![0])
+    }
+}
+
+#[tokio::test]
+async fn requests_end_on_timeout_or_exit() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let mut provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    // The provider stays stuck reading this, so it answers nothing.
+    let (release, stalled) = std_mpsc::channel();
+    let blob = provider.add_blob(Stall(Mutex::new(stalled))).unwrap();
+    let content = vec![Content::File(blob.media(None, None))];
+    provider.set_timeout(Some(Duration::from_millis(200)));
+    assert_eq!(
+        provider.send_message(home(port), None, content).await,
+        Err(RequestError::TimedOut)
+    );
+
+    // A request still waiting when the provider exits fails.
+    provider.set_timeout(None);
+    let (sent, ()) = tokio::join!(
+        provider.send_message(home(port), None, text("ping")),
+        async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            provider.kill();
+        }
+    );
+    assert_eq!(sent, Err(RequestError::NotRunning));
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
+    drop(release);
+}
+
+#[tokio::test]
+async fn kill_drops_events_waiting_for_room() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    // Room for the organization only, so the greeting waits.
+    let (events_tx, mut events) = mpsc::channel(1);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    timeout(Duration::from_secs(120), async {
+        while events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Give the greeting time to start waiting behind it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    provider.kill();
+    let ProviderEvent::Directory { .. } = next(&mut events).await else {
+        panic!("expected the organization");
+    };
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
 }
 
 #[tokio::test]

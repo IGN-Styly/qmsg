@@ -36,7 +36,9 @@ Each channel has a kind (text, voice, video, announcement, forum, thread,
 category, direct, group, or a custom one), an optional parent channel and
 member list, and the content it accepts with that platform's limits: the
 largest text and files, the MIME types, and how many attachments and bytes a
-message can have. Providers report the limits that apply to the account, and
+message can have. A kind can have several rules, such as small WebP stickers
+and larger images of any type, and text can be measured in characters, UTF-16
+units or bytes. Providers report the limits that apply to the account, and
 `Channel::check` tells either side exactly how a message breaks them.
 
 A provider sends a whole organization when it joins, then upserts or removes
@@ -53,13 +55,18 @@ wait for the answer: `send_message` returns the new message's id,
 `open_channel` opens or finds a conversation with some users, including ones
 the provider hasn't reported, such as an email address, and `read_blob` reads
 a file the provider sent. Failures say why, such as a limit the content
-breaks, a rate limit or a missing permission.
+breaks, a rate limit or a missing permission. Requests give up after a minute
+by default; don't wait on one, without a timeout, on the task that receives
+the provider's events, since its answer can queue behind them.
 
 Files of any size, or that only the provider can download, travel as blobs:
 the side that sends one keeps it, and the other reads it in pieces of up to
-4 MiB. The orchestrator offers files with `Orchestrator::add_blob`; providers
-read them with `Context::blob_reader` and offer their own with
-`Context::share`, or by answering `Command::ReadBlob` themselves.
+4 MiB. The orchestrator offers a file to one provider with
+`ProviderHandle::add_blob`, until it drops the `Blob`. Providers read it with
+`Context::blob_reader`, and offer their own with `Context::share`, or by
+answering `Command::ReadBlob` themselves. The orchestrator releases a
+provider's blob with `ProviderHandle::release_blob`; shared blobs are also
+dropped, oldest first, past 256 MiB.
 
 Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at

@@ -120,10 +120,12 @@ impl Provider for Echo {
                     };
                     cx.reply(request, result)?;
                 }
-                // Shared blobs are answered by `next_command`.
+                // Shared blobs are handled by `next_command`, and there are no
+                // others.
                 Command::ReadBlob { request, blob, .. } => {
                     cx.reply(request, Err(CommandError::UnknownBlob(blob)))?;
                 }
+                Command::ReleaseBlob { .. } => {}
                 Command::Shutdown => {
                     cx.emit(messages.make(&server, None, text("goodbye".into())))?;
                     break;
@@ -142,14 +144,14 @@ fn prepare(
 ) -> std::result::Result<(Vec<String>, Vec<Content>), CommandError> {
     let mut lines = Vec::new();
     let mut sent = Vec::new();
-    for part in content {
+    for (index, part) in (0u32..).zip(content) {
         match part {
             Content::Text(text) => {
                 lines.extend(text.split('\n').map(str::to_owned));
                 sent.push(Content::Text(text));
             }
             Content::File(media) => {
-                let bytes = fetch(cx, &media)?;
+                let bytes = fetch(cx, index, &media)?;
                 let name = media.name.clone().unwrap_or_default();
                 lines.push(format!("file {name}: {} bytes", bytes.len()));
                 sent.push(Content::File(Media {
@@ -164,8 +166,8 @@ fn prepare(
     Ok((lines, sent))
 }
 
-/// Reads a file the orchestrator sent, whatever its source.
-fn fetch(cx: &mut Context, media: &Media) -> std::result::Result<Vec<u8>, CommandError> {
+/// Reads a file the orchestrator sent as part `part`, whatever its source.
+fn fetch(cx: &mut Context, part: u32, media: &Media) -> std::result::Result<Vec<u8>, CommandError> {
     match &media.source {
         MediaSource::Bytes(bytes) => Ok(bytes.clone()),
         MediaSource::Blob(blob) => {
@@ -178,7 +180,7 @@ fn fetch(cx: &mut Context, media: &Media) -> std::result::Result<Vec<u8>, Comman
             match bytes.len() as u64 {
                 size if size > MAX_FILE => {
                     Err(CommandError::Rejected(qmsg_sdk::Violation::TooLarge {
-                        part: 0,
+                        part,
                         size,
                         max: MAX_FILE,
                     }))

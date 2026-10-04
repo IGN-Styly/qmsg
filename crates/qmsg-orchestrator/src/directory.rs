@@ -170,6 +170,12 @@ impl Entry {
                 self.organizations
                     .insert(id.clone(), OrganizationEntry { id, name, scope });
             }
+            DirectoryUpdate::OrganizationUpdated { id, name } => {
+                match self.organizations.get_mut(&id) {
+                    Some(organization) => organization.name = name,
+                    None => return Err(ApplyError::UnknownOrganization(id)),
+                }
+            }
             DirectoryUpdate::OrganizationRemoved { id } => {
                 self.organizations
                     .remove(&id)
@@ -288,6 +294,42 @@ mod tests {
         let ids: Vec<_> = scope.channels().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["thread"]);
         assert_eq!(d.user("p", Some("org"), "bo"), Some(&user("bo", "Bo")));
+    }
+
+    #[test]
+    fn updating_an_organization_keeps_its_users() {
+        let mut d = Directory::new();
+        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
+            .unwrap();
+        d.apply(
+            "p",
+            DirectoryUpdate::UserUpserted {
+                organization: org(),
+                user: user("bo", "Bo"),
+            },
+        )
+        .unwrap();
+        d.apply(
+            "p",
+            DirectoryUpdate::OrganizationUpdated {
+                id: "org".into(),
+                name: "Renamed".into(),
+            },
+        )
+        .unwrap();
+        let organization = d.organization("p", "org").unwrap();
+        assert_eq!(organization.name, "Renamed");
+        assert_eq!(organization.scope.users().count(), 2);
+        assert_eq!(
+            d.apply(
+                "p",
+                DirectoryUpdate::OrganizationUpdated {
+                    id: "nope".into(),
+                    name: "x".into(),
+                },
+            ),
+            Err(ApplyError::UnknownOrganization("nope".into()))
+        );
     }
 
     #[test]

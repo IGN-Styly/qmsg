@@ -13,16 +13,45 @@ use serde::{Deserialize, Serialize};
 use crate::{Content, ContentKind};
 
 /// What a channel takes of one kind of content.
+///
+/// A channel can have several rules for a kind, such as small WebP stickers
+/// and larger images of any type. A part follows the first rule for its kind
+/// that takes its MIME type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentRule {
     pub kind: ContentKind,
-    /// For text, the most characters (Unicode scalar values) in all of a
-    /// message's text parts together. For anything else, the most bytes in
-    /// each part.
+    /// For text, the longest all of a message's text parts can be together,
+    /// counted in [`ContentRule::text_unit`]s. For anything else, the most
+    /// bytes in each part.
     pub max_size: Option<u64>,
+    /// How text is measured against `max_size`.
+    pub text_unit: TextUnit,
     /// The MIME types taken for media, such as `image/png`, or `image/*` for
     /// any image. Empty takes any.
     pub mime_types: Vec<String>,
+}
+
+/// How a platform measures text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextUnit {
+    /// Unicode scalar values, Rust's `char`s.
+    #[default]
+    Chars,
+    /// UTF-16 code units, as JavaScript counts string length.
+    Utf16,
+    /// UTF-8 bytes.
+    Bytes,
+}
+
+impl TextUnit {
+    pub fn measure(self, text: &str) -> u64 {
+        let length = match self {
+            Self::Chars => text.chars().count(),
+            Self::Utf16 => text.encode_utf16().count(),
+            Self::Bytes => text.len(),
+        };
+        length as u64
+    }
 }
 
 impl ContentRule {
@@ -31,6 +60,7 @@ impl ContentRule {
         Self {
             kind,
             max_size: None,
+            text_unit: TextUnit::Chars,
             mime_types: Vec::new(),
         }
     }
@@ -38,6 +68,17 @@ impl ContentRule {
     pub fn max_size(self, max_size: u64) -> Self {
         Self {
             max_size: Some(max_size),
+            ..self
+        }
+    }
+
+    pub fn text_unit(self, text_unit: TextUnit) -> Self {
+        Self { text_unit, ..self }
+    }
+
+    pub fn mime_types<S: Into<String>>(self, mime_types: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            mime_types: mime_types.into_iter().map(Into::into).collect(),
             ..self
         }
     }
@@ -79,6 +120,7 @@ pub enum Violation {
         part: u32,
         mime: Option<String>,
     },
+    /// `length` is in the rule's [`TextUnit`].
     TextTooLong {
         length: u64,
         max: u64,
@@ -115,7 +157,7 @@ impl fmt::Display for Violation {
                 write!(f, "part {part}: the channel needs a MIME type")
             }
             Self::TextTooLong { length, max } => {
-                write!(f, "the text is {length} characters, over the {max} limit")
+                write!(f, "the text is {length} long, over the {max} limit")
             }
             Self::TooLarge { part, size, max } => {
                 write!(f, "part {part} is {size} bytes, over the {max} byte limit")
@@ -147,36 +189,48 @@ pub fn check(
     if content.is_empty() {
         return Err(Violation::Empty);
     }
+    let text_rule = rules.iter().find(|rule| rule.kind == ContentKind::Text);
     let mut text_length = 0u64;
     let mut attachments = 0u32;
     let mut total_size = 0u64;
     for (part, item) in (0u32..).zip(content) {
-        let Some(rule) = rules.iter().find(|rule| rule.kind.matches(item)) else {
+        let mut of_kind = rules
+            .iter()
+            .filter(|rule| rule.kind.matches(item))
+            .peekable();
+        if of_kind.peek().is_none() {
             return Err(Violation::Unsupported {
                 part,
                 kind: item.kind(),
             });
-        };
-        let size = match item {
+        }
+        let (rule, size) = match item {
             Content::Text(text) => {
-                text_length += text.chars().count() as u64;
+                if let Some(rule) = text_rule {
+                    text_length += rule.text_unit.measure(text);
+                }
                 continue;
             }
             Content::Image(media)
             | Content::Video(media)
             | Content::Audio(media)
             | Content::File(media) => {
-                if !rule.mime_types.is_empty()
-                    && !media.mime.as_deref().is_some_and(|m| rule.takes_mime(m))
-                {
+                let mime = media.mime.as_deref();
+                let rule = of_kind.find(|rule| {
+                    rule.mime_types.is_empty() || mime.is_some_and(|m| rule.takes_mime(m))
+                });
+                let Some(rule) = rule else {
                     return Err(Violation::UnsupportedMime {
                         part,
                         mime: media.mime.clone(),
                     });
-                }
-                media.size()
+                };
+                (rule, media.size())
             }
-            Content::Custom { data, .. } => Some(data.len() as u64),
+            Content::Custom { data, .. } => {
+                let rule = of_kind.next().expect("checked above");
+                (rule, Some(data.len() as u64))
+            }
         };
         attachments += 1;
         if let Some(size) = size {
@@ -188,11 +242,7 @@ pub fn check(
             }
         }
     }
-    let text_max = rules
-        .iter()
-        .find(|rule| rule.kind == ContentKind::Text)
-        .and_then(|rule| rule.max_size);
-    if let Some(max) = text_max
+    if let Some(max) = text_rule.and_then(|rule| rule.max_size)
         && text_length > max
     {
         return Err(Violation::TextTooLong {
@@ -237,10 +287,9 @@ mod tests {
     fn rules() -> (Vec<ContentRule>, MessageLimits) {
         let rules = vec![
             ContentRule::new(ContentKind::Text).max_size(2000),
-            ContentRule {
-                mime_types: vec!["image/*".into()],
-                ..ContentRule::new(ContentKind::Image).max_size(10_000_000)
-            },
+            ContentRule::new(ContentKind::Image)
+                .max_size(10_000_000)
+                .mime_types(["image/*"]),
         ];
         let limits = MessageLimits {
             max_attachments: Some(10),
@@ -317,6 +366,62 @@ mod tests {
         ];
         for (content, violation) in cases {
             assert_eq!(check(&rules, &limits, &content), Err(violation));
+        }
+    }
+
+    #[test]
+    fn parts_follow_the_first_rule_that_takes_their_mime_type() {
+        // Roughly WhatsApp's: small WebP stickers, larger images of any type.
+        let rules = [
+            ContentRule::new(ContentKind::Image)
+                .max_size(100_000)
+                .mime_types(["image/webp"]),
+            ContentRule::new(ContentKind::Image)
+                .max_size(5_000_000)
+                .mime_types(["image/*"]),
+        ];
+        let limits = MessageLimits::default();
+        let check = |content: Content| check(&rules, &limits, &[content]);
+        assert_eq!(check(image(Some("image/png"), 4_000_000)), Ok(()));
+        assert_eq!(
+            check(image(Some("image/webp"), 200_000)),
+            Err(Violation::TooLarge {
+                part: 0,
+                size: 200_000,
+                max: 100_000
+            })
+        );
+        assert_eq!(
+            check(image(Some("video/mp4"), 1)),
+            Err(Violation::UnsupportedMime {
+                part: 0,
+                mime: Some("video/mp4".into())
+            })
+        );
+    }
+
+    #[test]
+    fn text_is_measured_in_the_rule_unit() {
+        // One char, two UTF-16 units, four bytes.
+        let emoji = "😀";
+        for (unit, length) in [
+            (TextUnit::Chars, 1),
+            (TextUnit::Utf16, 2),
+            (TextUnit::Bytes, 4),
+        ] {
+            let rules = [ContentRule::new(ContentKind::Text)
+                .max_size(1)
+                .text_unit(unit)];
+            let result = check(
+                &rules,
+                &MessageLimits::default(),
+                &[Content::Text(emoji.into())],
+            );
+            let expected = match length {
+                1 => Ok(()),
+                _ => Err(Violation::TextTooLong { length, max: 1 }),
+            };
+            assert_eq!(result, expected, "{unit:?}");
         }
     }
 

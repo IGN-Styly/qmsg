@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 mod limits;
 
-pub use limits::{ContentRule, MessageLimits, Violation, check};
+pub use limits::{ContentRule, MessageLimits, TextUnit, Violation, check};
 
 /// Checked against each provider when it is loaded.
 pub const ABI_VERSION: u32 = 3;
@@ -50,6 +50,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// The most bytes one blob read returns.
 pub const MAX_READ: u32 = 4 * 1024 * 1024;
+
+/// The longest blob id or secret key, in bytes. The orchestrator disconnects
+/// a provider that sends a longer one.
+pub const MAX_ID: usize = 1024;
 
 /// Where a channel is: in an organization, or in the provider's standalone
 /// scope when `organization` is `None`.
@@ -167,6 +171,10 @@ pub enum MediaSource {
     /// messages it emits, the orchestrator in its commands. The other side
     /// reads it in pieces, so it can be any size. Use it too for files only
     /// the provider can download, such as ones behind the platform's login.
+    ///
+    /// A provider's blob stays readable until the orchestrator sends
+    /// [`Command::ReleaseBlob`], though a provider may drop old ones to save
+    /// memory. At most [`MAX_ID`] bytes.
     Blob(String),
 }
 
@@ -298,6 +306,11 @@ pub enum ChannelKind {
 pub enum DirectoryUpdate {
     /// Adds an organization, or replaces it along with its users and channels.
     OrganizationUpserted(Organization),
+    /// Changes an organization's details, keeping its users and channels.
+    OrganizationUpdated {
+        id: String,
+        name: String,
+    },
     /// The account left the organization, or it was deleted.
     OrganizationRemoved {
         id: String,
@@ -324,7 +337,7 @@ pub enum DirectoryUpdate {
 
 /// Work the orchestrator hands to a provider.
 ///
-/// The provider answers each command but `Shutdown` with a
+/// The provider answers each command but `ReleaseBlob` and `Shutdown` with a
 /// [`ProviderMessage::Reply`] carrying the command's `request`, which the
 /// orchestrator chooses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,7 +352,7 @@ pub enum Command {
     },
     /// Opens a conversation with `members`, or finds the one already open,
     /// answered with [`Reply::Opened`]. The provider reports the channel
-    /// before answering.
+    /// before answering, so its directory update comes first.
     ///
     /// Members are user ids in the organization's scope, or addresses the
     /// provider hasn't reported, such as an email address or phone number.
@@ -357,6 +370,11 @@ pub enum Command {
         blob: String,
         offset: u64,
         len: u32,
+    },
+    /// The orchestrator is done with a [`MediaSource::Blob`] the provider
+    /// sent, so the provider can free it. Not answered.
+    ReleaseBlob {
+        blob: String,
     },
     Shutdown,
 }
