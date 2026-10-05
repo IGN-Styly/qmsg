@@ -7,8 +7,9 @@
 //! each `Send`:
 //!
 //! - checks the content against the channel's limits,
-//! - reports the sent message, sharing each file back as a blob,
 //! - writes each line of text, and a line describing each file, to the server,
+//! - once the server has answered every line, reports the sent message,
+//!   sharing each file back as a blob,
 //! - and emits each of the server's replies as a reply to the sent message.
 //!
 //! `OpenChannel` with just the server finds the channel. On `Shutdown` it
@@ -94,6 +95,28 @@ impl Provider for Echo {
                             continue;
                         }
                     };
+                    // Deliver everything before answering, so success means
+                    // the server has it all. It answers each line, so send
+                    // them one at a time.
+                    let mut replies = Vec::new();
+                    for line in &lines {
+                        let reply = writeln!(conn.get_mut(), "{line}")
+                            .map_err(Into::into)
+                            .and_then(|()| read_line(&mut conn));
+                        match reply {
+                            Ok(reply) => replies.push(reply),
+                            Err(e) => {
+                                let error = format!(
+                                    "the server answered {} of {} lines: {e}",
+                                    replies.len(),
+                                    lines.len()
+                                );
+                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
+                                // Without the server there is nothing left to do.
+                                return Err(error.into());
+                            }
+                        }
+                    }
                     let sent = messages.make(ME, reply_to, sent_content);
                     cx.reply(
                         request,
@@ -102,11 +125,7 @@ impl Provider for Echo {
                         }),
                     )?;
                     cx.emit(sent.clone())?;
-                    // The server answers each line, so send them one at a
-                    // time.
-                    for line in lines {
-                        writeln!(conn.get_mut(), "{line}")?;
-                        let reply = read_line(&mut conn)?;
+                    for reply in replies {
                         cx.emit(messages.make(&server, Some(sent.id.clone()), text(reply)))?;
                     }
                 }

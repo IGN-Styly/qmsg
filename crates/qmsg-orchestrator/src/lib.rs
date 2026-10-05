@@ -22,10 +22,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 
@@ -308,7 +311,8 @@ impl Orchestrator {
     /// events waiting for room.
     ///
     /// Failing to load the Wasm is reported as an `Exited` event. Fails if a
-    /// provider with the same name hasn't delivered its `Exited` yet.
+    /// provider with the same name is still running; once it stops, its name
+    /// is free even if its `Exited` is still waiting for room.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
@@ -382,12 +386,18 @@ impl Orchestrator {
                     // Fail new requests, then the ones still waiting.
                     session.commands.lock().await.close();
                     session.requests.pending.lock().unwrap().clear();
-                    let permit = events.reserve().await;
-                    // Freeing the name and sending `Exited` together means a
-                    // new provider with this name can't send events first,
-                    // and can be spawned as soon as `Exited` is received.
-                    let mut sessions = sessions.lock().unwrap();
-                    sessions.remove(&token);
+                    // Take a place in the event channel's queue, which is
+                    // first come, first served, before freeing the name. A
+                    // new provider with this name then can't send events
+                    // before this `Exited`, yet the name is free even while
+                    // the channel is full and no one is reading it.
+                    let mut reserve = pin!(events.reserve());
+                    let ready = poll_fn(|cx| Poll::Ready(reserve.as_mut().poll(cx))).await;
+                    sessions.lock().unwrap().remove(&token);
+                    let permit = match ready {
+                        Poll::Ready(permit) => permit,
+                        Poll::Pending => reserve.await,
+                    };
                     if let Ok(permit) = permit {
                         permit.send(ProviderEvent::Exited {
                             provider: name,

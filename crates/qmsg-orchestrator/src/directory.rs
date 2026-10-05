@@ -187,10 +187,14 @@ impl Entry {
                     .insert(user.id.clone(), user);
             }
             DirectoryUpdate::UserRemoved { organization, id } => {
-                self.scope_mut(organization)?
-                    .users
-                    .remove(&id)
-                    .ok_or(ApplyError::UnknownUser(id))?;
+                let scope = self.scope_mut(organization)?;
+                if scope.users.remove(&id).is_none() {
+                    return Err(ApplyError::UnknownUser(id));
+                }
+                // The account is no longer there.
+                if scope.me.as_deref() == Some(id.as_str()) {
+                    scope.me = None;
+                }
             }
             DirectoryUpdate::ChannelUpserted {
                 organization,
@@ -210,7 +214,7 @@ impl Entry {
                     .ok_or(ApplyError::UnknownChannel(channel))?;
             }
             DirectoryUpdate::Me { organization, id } => {
-                self.scope_mut(organization)?.me = Some(id);
+                self.scope_mut(organization)?.me = id;
             }
         }
         Ok(())
@@ -333,6 +337,42 @@ mod tests {
     }
 
     #[test]
+    fn the_account_goes_with_its_user() {
+        let mut d = Directory::new();
+        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
+            .unwrap();
+        // Removing someone else, or no one, leaves it.
+        d.apply(
+            "p",
+            DirectoryUpdate::UserUpserted {
+                organization: org(),
+                user: user("bo", "Bo"),
+            },
+        )
+        .unwrap();
+        let remove = |id: &str| DirectoryUpdate::UserRemoved {
+            organization: org(),
+            id: id.into(),
+        };
+        d.apply("p", remove("bo")).unwrap();
+        assert!(d.apply("p", remove("nope")).is_err());
+        assert_eq!(d.scope("p", Some("org")).unwrap().me(), Some("ana"));
+
+        d.apply("p", remove("ana")).unwrap();
+        assert_eq!(d.scope("p", Some("org")).unwrap().me(), None);
+
+        // `Me` sets and clears it too.
+        let me = |id: Option<&str>| DirectoryUpdate::Me {
+            organization: org(),
+            id: id.map(str::to_owned),
+        };
+        d.apply("p", me(Some("bo"))).unwrap();
+        assert_eq!(d.scope("p", Some("org")).unwrap().me(), Some("bo"));
+        d.apply("p", me(None)).unwrap();
+        assert_eq!(d.scope("p", Some("org")).unwrap().me(), None);
+    }
+
+    #[test]
     fn keeps_users_and_channels_outside_organizations() {
         let mut d = Directory::new();
         let dm = Channel {
@@ -342,7 +382,7 @@ mod tests {
         let updates = [
             DirectoryUpdate::Me {
                 organization: None,
-                id: "me".into(),
+                id: Some("me".into()),
             },
             DirectoryUpdate::UserUpserted {
                 organization: None,

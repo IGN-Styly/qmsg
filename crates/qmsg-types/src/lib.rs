@@ -327,10 +327,11 @@ pub enum DirectoryUpdate {
         channel: Channel,
     },
     ChannelRemoved(ChannelRef),
-    /// Sets the account's own user id in a scope.
+    /// Sets the account's own user id in a scope, or clears it with `None`.
+    /// Removing that user clears it too.
     Me {
         organization: Option<String>,
-        id: String,
+        id: Option<String>,
     },
 }
 

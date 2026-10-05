@@ -43,6 +43,12 @@ fn echo_wasm() -> &'static PathBuf {
 
 /// Greets each client, then answers every line with `echo: <line>`.
 async fn start_server() -> u16 {
+    start_server_answering(usize::MAX).await
+}
+
+/// Like [`start_server`], but hangs up on a client once it has answered
+/// `answers` lines.
+async fn start_server_answering(answers: usize) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -51,7 +57,10 @@ async fn start_server() -> u16 {
                 let (read, mut write) = socket.into_split();
                 write.write_all(b"hello from server\n").await.unwrap();
                 let mut lines = BufReader::new(read).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                for _ in 0..answers {
+                    let Ok(Some(line)) = lines.next_line().await else {
+                        return;
+                    };
                     write
                         .write_all(format!("echo: {line}\n").as_bytes())
                         .await
@@ -224,6 +233,23 @@ async fn provider_owns_its_connection() {
     // Sent right before the provider returns, so it must still beat `Exited`.
     assert_eq!(received(&mut events).await.content, text("goodbye"));
     assert_eq!(exited(&mut events).await, Ok(()));
+}
+
+#[tokio::test]
+async fn a_send_the_server_drops_fails() {
+    let port = start_server_answering(1).await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let sent = provider.send_message(home(port), None, text("a\nb")).await;
+    let Err(RequestError::Failed(CommandError::Failed(error))) = sent else {
+        panic!("expected the send to fail, got {sent:?}");
+    };
+    assert!(error.contains("1 of 2 lines"), "{error}");
+    // The message wasn't reported as sent.
+    assert!(exited(&mut events).await.is_err());
 }
 
 #[tokio::test]
@@ -457,6 +483,42 @@ async fn requests_end_on_timeout_or_exit() {
     assert_eq!(sent, Err(RequestError::NotRunning));
     assert_eq!(exited(&mut events).await, Err("killed".into()));
     drop(release);
+}
+
+#[tokio::test]
+async fn a_killed_provider_frees_its_name_while_no_one_reads() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    // Room for the organization only, and nothing reads it for now.
+    let (events_tx, mut events) = mpsc::channel(1);
+    let old = orchestrator.spawn(spec(port), events_tx.clone()).unwrap();
+    timeout(Duration::from_secs(120), async {
+        while events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    old.kill();
+    let new = timeout(Duration::from_secs(30), async {
+        loop {
+            match orchestrator.spawn(spec(port), events_tx.clone()) {
+                Ok(new) => return new,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the name was never freed");
+
+    // The old provider's `Exited` still comes before anything from the new.
+    let ProviderEvent::Directory { .. } = next(&mut events).await else {
+        panic!("expected the old organization");
+    };
+    assert_eq!(exited(&mut events).await, Err("killed".into()));
+    started(&mut events).await;
+    drop(new);
 }
 
 #[tokio::test]
