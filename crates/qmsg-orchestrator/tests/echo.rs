@@ -248,7 +248,10 @@ async fn a_send_the_server_drops_fails() {
         panic!("expected the send to fail, got {sent:?}");
     };
     assert!(error.contains("1 of 2 lines"), "{error}");
-    // The message wasn't reported as sent.
+    // The server's answer still arrives, but the message isn't reported as
+    // sent.
+    let reply = received(&mut events).await;
+    assert_eq!((reply.content, reply.reply_to), (text("echo: a"), None));
     assert!(exited(&mut events).await.is_err());
 }
 

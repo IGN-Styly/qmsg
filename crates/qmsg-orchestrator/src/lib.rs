@@ -22,13 +22,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 
@@ -89,7 +86,7 @@ pub struct ProviderSpec {
 }
 
 /// Something a provider did. `Exited` is always a provider's last event, and
-/// its name can't be used by another provider until `Exited` is delivered.
+/// comes before any event of a later provider with the same name.
 #[derive(Debug)]
 pub enum ProviderEvent {
     Message {
@@ -132,6 +129,18 @@ struct Session {
     /// Set, under the sessions lock, once the provider has stopped running.
     /// No connection is accepted after.
     exiting: AtomicBool,
+    /// Set, under the sessions lock, once everything the provider sent has
+    /// been handled. Its name is free from then on, though it stays in the
+    /// sessions until its `Exited` is sent.
+    stopped: AtomicBool,
+    /// Orders sessions with the same name, latest highest.
+    started: u64,
+    /// Set once `Exited` is sent, or can't be.
+    exited: watch::Sender<bool>,
+    /// The `exited` of the previous provider with this name, if it was still
+    /// waiting to send its `Exited` when this one started. None of this
+    /// one's events are sent before that.
+    predecessor: Option<watch::Receiver<bool>>,
 }
 
 impl Session {
@@ -152,7 +161,19 @@ impl Session {
             // Checked first, so nothing more is sent once it is set.
             biased;
             _ = killed.wait_for(|&k| k) => {}
-            _ = self.events.send(event) => {}
+            _ = async {
+                self.after_predecessor().await;
+                let _ = self.events.send(event).await;
+            } => {}
+        }
+    }
+
+    /// Waits until the previous provider with this name has sent its
+    /// `Exited`, so no event of this one can come before it.
+    async fn after_predecessor(&self) {
+        if let Some(predecessor) = &self.predecessor {
+            // An error means it was dropped, which it only is once done.
+            let _ = predecessor.clone().wait_for(|&done| done).await;
         }
     }
 }
@@ -247,6 +268,8 @@ pub struct Orchestrator {
     engine: Engine,
     linker: Arc<Linker<WasiState>>,
     sessions: Sessions,
+    /// Providers spawned so far.
+    spawned: AtomicU64,
     secrets: Arc<Secrets>,
     blobs: Arc<Blobs>,
     addr: SocketAddr,
@@ -295,6 +318,7 @@ impl Orchestrator {
             engine,
             linker: Arc::new(linker),
             sessions,
+            spawned: AtomicU64::new(0),
             secrets: Arc::new(secrets),
             blobs: Arc::default(),
             addr,
@@ -312,7 +336,8 @@ impl Orchestrator {
     ///
     /// Failing to load the Wasm is reported as an `Exited` event. Fails if a
     /// provider with the same name is still running; once it stops, its name
-    /// is free even if its `Exited` is still waiting for room.
+    /// is free even if its `Exited` is still waiting for room. This one's
+    /// events then wait for that `Exited`.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
@@ -327,11 +352,16 @@ impl Orchestrator {
                 .build()?,
         ));
         let mut sessions = self.sessions.lock().unwrap();
+        let same_name = || sessions.values().filter(|s| s.name == spec.name);
         // Secrets are keyed by name, so two running providers with the same
         // name would share them.
-        if sessions.values().any(|s| s.name == spec.name) {
+        if same_name().any(|s| !s.stopped.load(Ordering::Relaxed)) {
             bail!("a provider named `{}` is already running", spec.name);
         }
+        // A stopped one may still be waiting to send its `Exited`.
+        let predecessor = same_name()
+            .max_by_key(|s| s.started)
+            .map(|s| s.exited.subscribe());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (kill, killed) = watch::channel(false);
         let session = Arc::new(Session {
@@ -345,6 +375,10 @@ impl Orchestrator {
             killed: killed.clone(),
             connections: watch::Sender::new(0),
             exiting: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            started: self.spawned.fetch_add(1, Ordering::Relaxed),
+            exited: watch::Sender::new(false),
+            predecessor,
         });
         let handle = ProviderHandle {
             commands: commands_tx,
@@ -386,24 +420,22 @@ impl Orchestrator {
                     // Fail new requests, then the ones still waiting.
                     session.commands.lock().await.close();
                     session.requests.pending.lock().unwrap().clear();
-                    // Take a place in the event channel's queue, which is
-                    // first come, first served, before freeing the name. A
-                    // new provider with this name then can't send events
-                    // before this `Exited`, yet the name is free even while
-                    // the channel is full and no one is reading it.
-                    let mut reserve = pin!(events.reserve());
-                    let ready = poll_fn(|cx| Poll::Ready(reserve.as_mut().poll(cx))).await;
-                    sessions.lock().unwrap().remove(&token);
-                    let permit = match ready {
-                        Poll::Ready(permit) => permit,
-                        Poll::Pending => reserve.await,
-                    };
-                    if let Ok(permit) = permit {
-                        permit.send(ProviderEvent::Exited {
+                    // Free the name now, so a full channel no one reads can't
+                    // hold it. A new provider with this name waits for this
+                    // `Exited` before sending anything.
+                    {
+                        let _sessions = sessions.lock().unwrap();
+                        session.stopped.store(true, Ordering::Relaxed);
+                    }
+                    session.after_predecessor().await;
+                    let _ = events
+                        .send(ProviderEvent::Exited {
                             provider: name,
                             result: result.map_err(|e| format!("{e:#}")),
-                        });
-                    }
+                        })
+                        .await;
+                    session.exited.send_replace(true);
+                    sessions.lock().unwrap().remove(&token);
                 })
             });
         if let Err(e) = spawned {
@@ -919,9 +951,17 @@ mod tests {
     use super::*;
 
     fn session() -> Arc<Session> {
+        session_after(mpsc::channel(1).0, None).0
+    }
+
+    /// Also returns the session's kill switch, whose dropping kills it.
+    fn session_after(
+        events: mpsc::Sender<ProviderEvent>,
+        predecessor: Option<watch::Receiver<bool>>,
+    ) -> (Arc<Session>, watch::Sender<bool>) {
         let (_commands, commands) = mpsc::unbounded_channel();
-        let (events, _) = mpsc::channel(1);
-        Arc::new(Session {
+        let (kill, killed) = watch::channel(false);
+        let session = Arc::new(Session {
             name: "p".into(),
             commands: tokio::sync::Mutex::new(commands),
             events,
@@ -929,10 +969,15 @@ mod tests {
             blobs: Weak::new(),
             token: "token".into(),
             requests: Arc::default(),
-            killed: watch::channel(false).1,
+            killed,
             connections: watch::Sender::new(0),
             exiting: AtomicBool::new(false),
-        })
+            stopped: AtomicBool::new(false),
+            started: 0,
+            exited: watch::Sender::new(false),
+            predecessor,
+        });
+        (session, kill)
     }
 
     /// A handle with no provider behind it, and what it queues.
@@ -963,6 +1008,30 @@ mod tests {
 
         session.exiting.store(true, Ordering::Relaxed);
         assert!(ConnectionGuard::new(session.clone()).is_none());
+    }
+
+    #[tokio::test]
+    async fn events_wait_for_the_previous_providers_exit() {
+        // Plenty of room, so only the predecessor holds the event back.
+        let (events, mut received) = mpsc::channel(8);
+        let (exited, predecessor) = watch::channel(false);
+        let (session, _kill) = session_after(events, Some(predecessor));
+        let forwarding = tokio::spawn({
+            let session = session.clone();
+            async move {
+                let event = ProviderEvent::Exited {
+                    provider: "p".into(),
+                    result: Ok(()),
+                };
+                session.forward(event).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(received.is_empty());
+
+        exited.send_replace(true);
+        forwarding.await.unwrap();
+        assert!(received.try_recv().is_ok());
     }
 
     #[tokio::test]
