@@ -60,49 +60,23 @@ pub struct Context {
     shared: Shared,
 }
 
-/// Blobs answered without involving the provider.
+/// Blobs answered without involving the provider, kept until released.
 #[derive(Default)]
 struct Shared {
     blobs: HashMap<String, Vec<u8>>,
-    /// Ids, oldest first.
-    order: VecDeque<String>,
-    bytes: usize,
-    limit: usize,
     next: u64,
 }
-
-/// The default for [`Context::set_share_limit`].
-pub const SHARE_LIMIT: usize = 256 * 1024 * 1024;
 
 impl Shared {
     fn insert(&mut self, bytes: Vec<u8>) -> String {
         self.next += 1;
         let id = format!("shared-{}", self.next);
-        self.bytes += bytes.len();
         self.blobs.insert(id.clone(), bytes);
-        self.order.push_back(id.clone());
-        self.trim();
         id
     }
 
     fn remove(&mut self, id: &str) -> bool {
-        let Some(bytes) = self.blobs.remove(id) else {
-            return false;
-        };
-        self.bytes -= bytes.len();
-        self.order.retain(|other| other != id);
-        true
-    }
-
-    /// Drops the oldest blobs until they fit the limit.
-    fn trim(&mut self) {
-        while self.bytes > self.limit
-            && let Some(id) = self.order.pop_front()
-        {
-            if let Some(bytes) = self.blobs.remove(&id) {
-                self.bytes -= bytes.len();
-            }
-        }
+        self.blobs.remove(id).is_some()
     }
 }
 
@@ -126,10 +100,7 @@ impl Context {
             config,
             socket,
             pending: VecDeque::new(),
-            shared: Shared {
-                limit: SHARE_LIMIT,
-                ..Shared::default()
-            },
+            shared: Shared::default(),
         })
     }
 
@@ -171,8 +142,7 @@ impl Context {
 
     /// Makes `bytes` readable by the orchestrator as a [`MediaSource::Blob`],
     /// returning its id. [`Context::next_command`] answers its reads until the
-    /// orchestrator releases it, [`Context::unshare`] is called, or it is the
-    /// oldest when shared blobs go over [`Context::set_share_limit`].
+    /// orchestrator releases it or [`Context::unshare`] is called.
     ///
     /// For files the provider has to fetch from the platform, use an id of
     /// its own instead and answer [`Command::ReadBlob`] itself.
@@ -182,13 +152,6 @@ impl Context {
 
     pub fn unshare(&mut self, id: &str) {
         self.shared.remove(id);
-    }
-
-    /// How many bytes shared blobs may hold together, [`SHARE_LIMIT`] by
-    /// default. The oldest are dropped to make room.
-    pub fn set_share_limit(&mut self, bytes: usize) {
-        self.shared.limit = bytes;
-        self.shared.trim();
     }
 
     /// Reads up to `len` bytes, at most [`types::MAX_READ`], of a blob the
@@ -558,20 +521,14 @@ mod tests {
     }
 
     #[test]
-    fn the_oldest_shared_blobs_make_room() {
-        let mut shared = Shared {
-            limit: 10,
-            ..Shared::default()
-        };
+    fn shared_blobs_are_kept_until_removed() {
+        let mut shared = Shared::default();
         let a = shared.insert(vec![0; 6]);
         let b = shared.insert(vec![0; 4]);
-        let c = shared.insert(vec![0; 6]);
-        assert!(!shared.blobs.contains_key(&a));
-        assert!(shared.blobs.contains_key(&b) && shared.blobs.contains_key(&c));
-        assert_eq!(shared.bytes, 10);
-        assert!(shared.remove(&b));
-        assert!(!shared.remove(&b));
-        assert_eq!((shared.bytes, shared.order.len()), (6, 1));
+        assert_ne!(a, b);
+        assert!(shared.remove(&a));
+        assert!(!shared.remove(&a));
+        assert!(shared.blobs.contains_key(&b));
     }
 
     #[test]

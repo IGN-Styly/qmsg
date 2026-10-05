@@ -173,8 +173,7 @@ pub enum MediaSource {
     /// the provider can download, such as ones behind the platform's login.
     ///
     /// A provider's blob stays readable until the orchestrator sends
-    /// [`Command::ReleaseBlob`], though a provider may drop old ones to save
-    /// memory. At most [`MAX_ID`] bytes.
+    /// [`Command::ReleaseBlob`]. At most [`MAX_ID`] bytes.
     Blob(String),
 }
 

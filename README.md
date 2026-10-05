@@ -64,9 +64,8 @@ the side that sends one keeps it, and the other reads it in pieces of up to
 4 MiB. The orchestrator offers a file to one provider with
 `ProviderHandle::add_blob`, until it drops the `Blob`. Providers read it with
 `Context::blob_reader`, and offer their own with `Context::share`, or by
-answering `Command::ReadBlob` themselves. The orchestrator releases a
-provider's blob with `ProviderHandle::release_blob`; shared blobs are also
-dropped, oldest first, past 256 MiB.
+answering `Command::ReadBlob` themselves. A provider keeps its blobs until
+the orchestrator releases them with `ProviderHandle::release_blob`.
 
 Providers keep secrets, such as tokens, with `secret_get`, `secret_set` and
 `secret_delete` in the SDK. The orchestrator stores them in SQLite at
