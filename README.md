@@ -42,8 +42,21 @@ units or bytes. Providers report the limits that apply to the account, and
 `Channel::check` tells either side exactly how a message breaks them.
 
 A provider sends a whole organization when it joins, then upserts or removes
-single users and channels as they change. The orchestrator passes these on as `ProviderEvent::Directory`, and
-`Directory` keeps the current state for each provider.
+single users and channels as they change. The orchestrator passes these on as
+`ProviderEvent::Directory`. Every event carries a `ProviderId { name, instance }`,
+which also comes from `ProviderHandle::id()`. Each spawn gets a unique instance
+number across all orchestrators in this process; these are not persistent ids.
+`Directory` takes that full id for updates, lookups and `remove_provider` on
+`Exited`. A delayed exit or update from an old instance cannot change a new
+instance's state, even when consumers merge separate event channels.
+
+`Exited` is the last event of its own instance. There is no order between
+instances. A name becomes free after its provider stops and its connection
+finishes draining, including secret operations; sending `Exited` can still
+wait for channel space. A replacement never waits for that exit to be read.
+Secrets stay keyed by name so the replacement can use them. `kill()` and
+handle drop stop the provider and discard events still waiting for room.
+Already queued events remain, and `Exited` follows when there is room.
 
 Messages have an id, a timestamp and an optional message they reply to. Their
 content is a list of parts, so one message can carry text, images, video,
@@ -56,8 +69,19 @@ wait for the answer: `send_message` returns the new message's id,
 the provider hasn't reported, such as an email address, and `read_blob` reads
 a file the provider sent. Failures say why, such as a limit the content
 breaks, a rate limit or a missing permission. Requests give up after a minute
-by default; don't wait on one, without a timeout, on the task that receives
-the provider's events, since its answer can queue behind them.
+by default. Drain events on a separate task from requests: an answer may wait
+behind events in a full channel. Keep timeouts enabled to bound the wait if
+the consumer stalls. A timeout, exit before answering or kill leaves delivery
+unknown; the server may have processed the command, so do not retry blindly.
+
+Echo queues the sent message and all server replies before answering success.
+On partial failure, it queues the replies it has received (without a `reply_to`,
+since the whole message was not sent), then answers with how many lines the
+server confirmed, and exits. The last failed line may also have reached the
+server without a reply. Either answer can wait for event queue space. After
+receiving an answer, callers can kill or drop echo without losing those queued
+replies. A timeout is not an answer; killing before an answer can lose events.
+This is an in-memory ordering guarantee, not durable or exactly-once delivery.
 
 Files of any size, or that only the provider can download, travel as blobs:
 the side that sends one keeps it, and the other reads it in pieces of up to

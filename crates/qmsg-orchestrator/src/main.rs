@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
                             .author(&provider, &message)
                             .map_or(message.author.as_str(), |u| u.name.as_str());
                         tracing::info!(
-                            provider,
+                            provider = ?provider,
                             organization = message.channel.organization.as_deref().unwrap_or("-"),
                             channel = message.channel.channel,
                             id = message.id,
@@ -70,16 +70,16 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     MessageEvent::Edited { channel, id, content } => {
-                        tracing::info!(provider, channel = channel.channel, id, "edited: {}", describe(&content));
+                        tracing::info!(provider = ?provider, channel = channel.channel, id, "edited: {}", describe(&content));
                     }
                     MessageEvent::Deleted { channel, id } => {
-                        tracing::info!(provider, channel = channel.channel, id, "deleted");
+                        tracing::info!(provider = ?provider, channel = channel.channel, id, "deleted");
                     }
                 },
                 ProviderEvent::Directory { provider, update } => {
                     if let DirectoryUpdate::OrganizationUpserted(organization) = &update {
                         tracing::info!(
-                            provider,
+                            provider = ?provider,
                             organization = organization.id,
                             users = organization.users.len(),
                             channels = organization.channels.len(),
@@ -87,24 +87,24 @@ async fn main() -> anyhow::Result<()> {
                             organization.name,
                         );
                     } else {
-                        tracing::debug!(provider, "{update:?}");
+                        tracing::debug!(provider = ?provider, "{update:?}");
                     }
                     if let Err(e) = directory.apply(&provider, update) {
-                        tracing::warn!(provider, "ignored directory update: {e}");
+                        tracing::warn!(provider = ?provider, "ignored directory update: {e}");
                     }
                 }
                 ProviderEvent::Exited { provider, result } => {
                     running -= 1;
                     directory.remove_provider(&provider);
                     match result {
-                        Ok(()) => tracing::info!(provider, "exited"),
-                        Err(e) => tracing::error!(provider, "exited: {e}"),
+                        Ok(()) => tracing::info!(provider = ?provider, "exited"),
+                        Err(e) => tracing::error!(provider = ?provider, "exited: {e}"),
                     }
                 }
             },
             _ = tokio::signal::ctrl_c() => {
                 if shutting_down {
-                    // Killed providers still send `Exited`, right away.
+                    // Keep draining so killed providers can send `Exited`.
                     tracing::warn!("killing providers");
                     for handle in &handles {
                         handle.kill();

@@ -158,14 +158,15 @@ async fn provider_reports_its_organization() {
     let ProviderEvent::Directory { provider, update } = next(&mut events).await else {
         panic!("expected the organization");
     };
+    assert_eq!(&provider, _provider.id());
     assert!(matches!(update, DirectoryUpdate::OrganizationUpserted(_)));
     directory.apply(&provider, update).unwrap();
 
-    let channel = directory.channel("echo", &home(port)).unwrap();
+    let channel = directory.channel(&provider, &home(port)).unwrap();
     assert_eq!(channel.kind, ChannelKind::Text);
     assert_eq!(channel.limits.max_attachments, Some(1));
     assert_eq!(
-        directory.scope("echo", Some(&server)).unwrap().me(),
+        directory.scope(&provider, Some(&server)).unwrap().me(),
         Some("me")
     );
     // The orchestrator can check content against the channel's limits itself.
@@ -182,7 +183,7 @@ async fn provider_reports_its_organization() {
     let greeting = received(&mut events).await;
     assert_eq!(greeting.channel, home(port));
     assert_eq!(greeting.content, text("hello from server"));
-    assert_eq!(directory.author("echo", &greeting).unwrap().id, server);
+    assert_eq!(directory.author(&provider, &greeting).unwrap().id, server);
 }
 
 #[tokio::test]
@@ -253,6 +254,57 @@ async fn a_send_the_server_drops_fails() {
     let reply = received(&mut events).await;
     assert_eq!((reply.content, reply.reply_to), (text("echo: a"), None));
     assert!(exited(&mut events).await.is_err());
+}
+
+#[tokio::test]
+async fn partial_replies_are_queued_before_failure_even_when_events_fill() {
+    let port = start_server_answering(2).await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(1);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let sent = provider.send_message(home(port), None, text("a\nb\nc"));
+    tokio::pin!(sent);
+    // The second reply cannot fit. A terminal answer must wait for it.
+    assert!(
+        timeout(Duration::from_millis(200), &mut sent)
+            .await
+            .is_err()
+    );
+    assert_eq!(received(&mut events).await.content, text("echo: a"));
+    let result = timeout(Duration::from_secs(30), &mut sent).await.unwrap();
+    let Err(RequestError::Failed(CommandError::Failed(error))) = result else {
+        panic!("expected partial failure, got {result:?}");
+    };
+    assert!(error.contains("2 of 3 lines"), "{error}");
+    provider.kill();
+    // A kill after the answer cannot discard the already queued reply.
+    let reply = received(&mut events).await;
+    assert_eq!((reply.content, reply.reply_to), (text("echo: b"), None));
+    assert!(exited(&mut events).await.is_err());
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn success_queues_all_events_before_the_handle_is_dropped() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(2);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+
+    let id = provider
+        .send_message(home(port), None, text("ping"))
+        .await
+        .unwrap();
+    // Both the sent message and server reply must already be in the queue.
+    assert_eq!(events.len(), 2);
+    drop(provider);
+    assert_eq!(received(&mut events).await.id, id);
+    assert_eq!(received(&mut events).await.content, text("echo: ping"));
+    assert!(exited(&mut events).await.is_err());
+    assert!(events.recv().await.is_none());
 }
 
 #[tokio::test]
@@ -515,22 +567,58 @@ async fn a_killed_provider_frees_its_name_while_no_one_reads() {
     .await
     .expect("the name was never freed");
 
-    // The old provider's `Exited` still comes before anything from the new.
-    let ProviderEvent::Directory { .. } = next(&mut events).await else {
-        panic!("expected the old organization");
+    assert_ne!(old.id(), new.id());
+    assert_eq!(old.id().name, new.id().name);
+    // Shutdown requests fail before anyone makes room for the old Exited.
+    assert_eq!(old.shutdown(), Err(RequestError::NotRunning));
+    let old_id = old.id().clone();
+    drop(old); // Its kill switch must not affect the replacement.
+
+    let mut old_exited = false;
+    let mut new_directory = false;
+    let mut new_greeting = false;
+    while !(old_exited && new_directory && new_greeting) {
+        match next(&mut events).await {
+            ProviderEvent::Directory { provider, .. } if provider == old_id => {
+                assert!(!old_exited);
+            }
+            ProviderEvent::Exited { provider, result } if provider == old_id => {
+                assert!(!old_exited);
+                assert_eq!(result, Err("killed".into()));
+                old_exited = true;
+            }
+            ProviderEvent::Directory { provider, .. } if &provider == new.id() => {
+                new_directory = true;
+            }
+            ProviderEvent::Message { provider, .. } if &provider == new.id() => {
+                assert!(new_directory);
+                new_greeting = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let server = format!("127.0.0.1:{port}");
+    assert_eq!(
+        new.open_channel(Some(server.clone()), vec![server]).await,
+        Ok(home(port))
+    );
+    new.kill();
+    let ProviderEvent::Exited { provider, result } = next(&mut events).await else {
+        panic!("expected the replacement's exit");
     };
-    assert_eq!(exited(&mut events).await, Err("killed".into()));
-    started(&mut events).await;
-    drop(new);
+    assert_eq!(&provider, new.id());
+    assert_eq!(result, Err("killed".into()));
+    drop(events_tx);
+    assert!(events.recv().await.is_none());
 }
 
 #[tokio::test]
-async fn a_replacement_on_another_channel_doesnt_wait() {
+async fn a_late_exit_on_another_channel_keeps_the_replacement_directory() {
     let port = start_server().await;
     let (orchestrator, _dir) = orchestrator().await;
     // The old provider's channel has room for its organization only, and no
-    // one ever reads it, so its `Exited` can't be sent.
-    let (old_tx, old_events) = mpsc::channel(1);
+    // one reads it until the replacement is live, so Exited must wait.
+    let (old_tx, mut old_events) = mpsc::channel(1);
     let old = orchestrator.spawn(spec(port), old_tx).unwrap();
     timeout(Duration::from_secs(120), async {
         while old_events.is_empty() {
@@ -542,7 +630,7 @@ async fn a_replacement_on_another_channel_doesnt_wait() {
     old.kill();
 
     let (new_tx, mut new_events) = mpsc::channel(16);
-    let _new = timeout(Duration::from_secs(30), async {
+    let new = timeout(Duration::from_secs(30), async {
         loop {
             match orchestrator.spawn(spec(port), new_tx.clone()) {
                 Ok(new) => return new,
@@ -552,8 +640,37 @@ async fn a_replacement_on_another_channel_doesnt_wait() {
     })
     .await
     .expect("the name was never freed");
-    started(&mut new_events).await;
-    drop(old_events);
+    let mut directory = Directory::new();
+    let ProviderEvent::Directory {
+        provider: new_id,
+        update,
+    } = next(&mut new_events).await
+    else {
+        panic!("expected the new organization");
+    };
+    assert_eq!(&new_id, new.id());
+    assert_ne!(&new_id, old.id());
+    directory.apply(&new_id, update).unwrap();
+    received(&mut new_events).await;
+    // Merge the delayed old events only after the new instance is live.
+    let ProviderEvent::Directory {
+        provider: old_id,
+        update,
+    } = next(&mut old_events).await
+    else {
+        panic!("expected the old organization");
+    };
+    assert_eq!(&old_id, old.id());
+    directory.apply(&old_id, update).unwrap();
+    let ProviderEvent::Exited { provider, result } = next(&mut old_events).await else {
+        panic!("expected the old exit");
+    };
+    assert_eq!(provider, old_id);
+    assert_eq!(result, Err("killed".into()));
+    directory.remove_provider(&provider);
+    assert!(directory.channel(&new_id, &home(port)).is_some());
+    assert!(directory.channel(&old_id, &home(port)).is_none());
+    assert!(old_events.recv().await.is_none());
 }
 
 #[tokio::test]

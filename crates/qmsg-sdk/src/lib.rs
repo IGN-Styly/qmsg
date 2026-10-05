@@ -132,6 +132,12 @@ impl Context {
     }
 
     /// Answers a [`Command`] by its `request`.
+    ///
+    /// Emit any events the caller must keep before answering, including on
+    /// partial failure. The host queues preceding events before delivering
+    /// this answer, unless the provider is killed (which cancels requests and
+    /// can discard events). Thus an answer may wait for event queue space;
+    /// callers must drain events on a separate task from requests.
     pub fn reply(
         &mut self,
         request: u64,

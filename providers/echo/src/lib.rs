@@ -10,7 +10,16 @@
 //! - writes each line of text, and a line describing each file, to the server,
 //! - once the server has answered every line, reports the sent message,
 //!   sharing each file back as a blob,
-//! - and emits each of the server's replies as a reply to the sent message.
+//! - emits each of the server's replies as a reply to the sent message,
+//! - then answers success, after those events on the host connection.
+//!
+//! On partial failure it emits every reply received, without a `reply_to`,
+//! then answers with the count of confirmed lines and exits. The failed line
+//! may have reached the server too. Both success and failure wait for event
+//! queue space; callers must drain events on a separate task and use request
+//! timeouts. After an answer, killing or dropping the handle cannot lose those
+//! queued replies. A timeout or kill before the answer leaves delivery unknown
+//! and can discard events. This does not provide durable delivery.
 //!
 //! `OpenChannel` with just the server finds the channel. On `Shutdown` it
 //! emits a goodbye and returns.
@@ -111,30 +120,29 @@ impl Provider for Echo {
                                     replies.len(),
                                     lines.len()
                                 );
-                                // Answered first, so a full event channel can't
-                                // hold up the failure.
-                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
                                 // The server did answer these, though the
                                 // message they answer was never sent whole.
                                 for reply in replies {
                                     cx.emit(messages.make(&server, None, text(reply)))?;
                                 }
+                                // Events precede the answer on the host connection.
+                                // Thus a caller can kill/drop us after this failure
+                                // without losing replies. A full event channel delays
+                                // the answer: callers must drain it on another task
+                                // and use request timeouts (not reorder the failure).
+                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
                                 // Without the server there is nothing left to do.
                                 return Err(error.into());
                             }
                         }
                     }
                     let sent = messages.make(ME, reply_to, sent_content);
-                    cx.reply(
-                        request,
-                        Ok(Reply::Sent {
-                            id: sent.id.clone(),
-                        }),
-                    )?;
                     cx.emit(sent.clone())?;
                     for reply in replies {
                         cx.emit(messages.make(&server, Some(sent.id.clone()), text(reply)))?;
                     }
+                    // Apply the same event-before-answer rule to success.
+                    cx.reply(request, Ok(Reply::Sent { id: sent.id }))?;
                 }
                 Command::OpenChannel {
                     request,

@@ -3,13 +3,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+use crate::ProviderId;
+
 use qmsg_types::{Channel, ChannelRef, DirectoryUpdate, Message, Organization, User};
 
-/// Organizations, users and channels by provider, kept up to date from
+/// Organizations, users and channels by provider instance, kept up to date from
 /// [`ProviderEvent::Directory`](crate::ProviderEvent::Directory).
 #[derive(Debug, Default)]
 pub struct Directory {
-    providers: HashMap<String, Entry>,
+    providers: HashMap<ProviderId, Entry>,
 }
 
 #[derive(Debug, Default)]
@@ -96,7 +98,11 @@ impl Directory {
     /// hasn't reported and for removals of things that aren't there. Either
     /// means the provider sent updates out of order, or the directory missed
     /// some.
-    pub fn apply(&mut self, provider: &str, update: DirectoryUpdate) -> Result<(), ApplyError> {
+    pub fn apply(
+        &mut self,
+        provider: &ProviderId,
+        update: DirectoryUpdate,
+    ) -> Result<(), ApplyError> {
         let entry = self.providers.entry(provider.to_owned()).or_default();
         let result = entry.apply(update);
         if entry.organizations.is_empty() && entry.standalone.is_empty() {
@@ -105,26 +111,27 @@ impl Directory {
         result
     }
 
-    /// Forgets everything `provider` reported, such as once it has exited.
-    pub fn remove_provider(&mut self, provider: &str) {
+    /// Forgets only this instance's state when its `Exited` arrives. A later
+    /// spawn with the same name has a different id and keeps its state.
+    pub fn remove_provider(&mut self, provider: &ProviderId) {
         self.providers.remove(provider);
     }
 
     /// The provider's organizations, ordered by id.
-    pub fn organizations(&self, provider: &str) -> impl Iterator<Item = &OrganizationEntry> {
+    pub fn organizations(&self, provider: &ProviderId) -> impl Iterator<Item = &OrganizationEntry> {
         self.providers
             .get(provider)
             .into_iter()
             .flat_map(|entry| entry.organizations.values())
     }
 
-    pub fn organization(&self, provider: &str, id: &str) -> Option<&OrganizationEntry> {
+    pub fn organization(&self, provider: &ProviderId, id: &str) -> Option<&OrganizationEntry> {
         self.providers.get(provider)?.organizations.get(id)
     }
 
     /// The users and channels in `organization`, or outside any when it is
     /// `None`.
-    pub fn scope(&self, provider: &str, organization: Option<&str>) -> Option<&Scope> {
+    pub fn scope(&self, provider: &ProviderId, organization: Option<&str>) -> Option<&Scope> {
         let entry = self.providers.get(provider)?;
         match organization {
             Some(id) => entry.organizations.get(id).map(|o| &o.scope),
@@ -132,17 +139,22 @@ impl Directory {
         }
     }
 
-    pub fn user(&self, provider: &str, organization: Option<&str>, id: &str) -> Option<&User> {
+    pub fn user(
+        &self,
+        provider: &ProviderId,
+        organization: Option<&str>,
+        id: &str,
+    ) -> Option<&User> {
         self.scope(provider, organization)?.user(id)
     }
 
-    pub fn channel(&self, provider: &str, channel: &ChannelRef) -> Option<&Channel> {
+    pub fn channel(&self, provider: &ProviderId, channel: &ChannelRef) -> Option<&Channel> {
         self.scope(provider, channel.organization.as_deref())?
             .channel(&channel.channel)
     }
 
     /// The message's author, from its channel's scope.
-    pub fn author(&self, provider: &str, message: &Message) -> Option<&User> {
+    pub fn author(&self, provider: &ProviderId, message: &Message) -> Option<&User> {
         self.user(
             provider,
             message.channel.organization.as_deref(),
@@ -237,6 +249,13 @@ mod tests {
 
     use super::*;
 
+    fn provider(name: &str) -> ProviderId {
+        ProviderId {
+            name: name.into(),
+            instance: 0,
+        }
+    }
+
     fn user(id: &str, name: &str) -> User {
         User {
             id: id.into(),
@@ -265,8 +284,11 @@ mod tests {
     #[test]
     fn updates_users_and_channels() {
         let mut d = Directory::new();
-        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
+        d.apply(
+            &provider("p"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
         let updates = [
             DirectoryUpdate::UserUpserted {
                 organization: org(),
@@ -286,10 +308,10 @@ mod tests {
             DirectoryUpdate::ChannelRemoved(ChannelRef::new(Some("org"), "general")),
         ];
         for update in updates {
-            d.apply("p", update).unwrap();
+            d.apply(&provider("p"), update).unwrap();
         }
 
-        let scope = d.scope("p", Some("org")).unwrap();
+        let scope = d.scope(&provider("p"), Some("org")).unwrap();
         assert_eq!(scope.me(), Some("ana"));
         assert_eq!(
             scope.users().collect::<Vec<_>>(),
@@ -297,16 +319,22 @@ mod tests {
         );
         let ids: Vec<_> = scope.channels().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["thread"]);
-        assert_eq!(d.user("p", Some("org"), "bo"), Some(&user("bo", "Bo")));
+        assert_eq!(
+            d.user(&provider("p"), Some("org"), "bo"),
+            Some(&user("bo", "Bo"))
+        );
     }
 
     #[test]
     fn updating_an_organization_keeps_its_users() {
         let mut d = Directory::new();
-        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
         d.apply(
-            "p",
+            &provider("p"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
+        d.apply(
+            &provider("p"),
             DirectoryUpdate::UserUpserted {
                 organization: org(),
                 user: user("bo", "Bo"),
@@ -314,19 +342,19 @@ mod tests {
         )
         .unwrap();
         d.apply(
-            "p",
+            &provider("p"),
             DirectoryUpdate::OrganizationUpdated {
                 id: "org".into(),
                 name: "Renamed".into(),
             },
         )
         .unwrap();
-        let organization = d.organization("p", "org").unwrap();
+        let organization = d.organization(&provider("p"), "org").unwrap();
         assert_eq!(organization.name, "Renamed");
         assert_eq!(organization.scope.users().count(), 2);
         assert_eq!(
             d.apply(
-                "p",
+                &provider("p"),
                 DirectoryUpdate::OrganizationUpdated {
                     id: "nope".into(),
                     name: "x".into(),
@@ -339,11 +367,14 @@ mod tests {
     #[test]
     fn the_account_goes_with_its_user() {
         let mut d = Directory::new();
-        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
+        d.apply(
+            &provider("p"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
         // Removing someone else, or no one, leaves it.
         d.apply(
-            "p",
+            &provider("p"),
             DirectoryUpdate::UserUpserted {
                 organization: org(),
                 user: user("bo", "Bo"),
@@ -354,22 +385,28 @@ mod tests {
             organization: org(),
             id: id.into(),
         };
-        d.apply("p", remove("bo")).unwrap();
-        assert!(d.apply("p", remove("nope")).is_err());
-        assert_eq!(d.scope("p", Some("org")).unwrap().me(), Some("ana"));
+        d.apply(&provider("p"), remove("bo")).unwrap();
+        assert!(d.apply(&provider("p"), remove("nope")).is_err());
+        assert_eq!(
+            d.scope(&provider("p"), Some("org")).unwrap().me(),
+            Some("ana")
+        );
 
-        d.apply("p", remove("ana")).unwrap();
-        assert_eq!(d.scope("p", Some("org")).unwrap().me(), None);
+        d.apply(&provider("p"), remove("ana")).unwrap();
+        assert_eq!(d.scope(&provider("p"), Some("org")).unwrap().me(), None);
 
         // `Me` sets and clears it too.
         let me = |id: Option<&str>| DirectoryUpdate::Me {
             organization: org(),
             id: id.map(str::to_owned),
         };
-        d.apply("p", me(Some("bo"))).unwrap();
-        assert_eq!(d.scope("p", Some("org")).unwrap().me(), Some("bo"));
-        d.apply("p", me(None)).unwrap();
-        assert_eq!(d.scope("p", Some("org")).unwrap().me(), None);
+        d.apply(&provider("p"), me(Some("bo"))).unwrap();
+        assert_eq!(
+            d.scope(&provider("p"), Some("org")).unwrap().me(),
+            Some("bo")
+        );
+        d.apply(&provider("p"), me(None)).unwrap();
+        assert_eq!(d.scope(&provider("p"), Some("org")).unwrap().me(), None);
     }
 
     #[test]
@@ -394,15 +431,15 @@ mod tests {
             },
         ];
         for update in updates {
-            d.apply("p", update).unwrap();
+            d.apply(&provider("p"), update).unwrap();
         }
-        assert_eq!(d.organizations("p").count(), 0);
+        assert_eq!(d.organizations(&provider("p")).count(), 0);
         let dm_ref = ChannelRef::new(None, "dm-ana");
-        assert_eq!(d.channel("p", &dm_ref), Some(&dm));
-        assert_eq!(d.scope("p", None).unwrap().me(), Some("me"));
+        assert_eq!(d.channel(&provider("p"), &dm_ref), Some(&dm));
+        assert_eq!(d.scope(&provider("p"), None).unwrap().me(), Some("me"));
         // A channel with the same id in an organization is a different one.
         assert_eq!(
-            d.channel("p", &ChannelRef::new(Some("org"), "dm-ana")),
+            d.channel(&provider("p"), &ChannelRef::new(Some("org"), "dm-ana")),
             None
         );
 
@@ -414,31 +451,40 @@ mod tests {
             reply_to: None,
             content: vec![Content::Text("hi".into())],
         };
-        assert_eq!(d.author("p", &message), Some(&user("ana", "Ana")));
+        assert_eq!(
+            d.author(&provider("p"), &message),
+            Some(&user("ana", "Ana"))
+        );
 
-        d.apply("p", DirectoryUpdate::ChannelRemoved(dm_ref))
+        d.apply(&provider("p"), DirectoryUpdate::ChannelRemoved(dm_ref))
             .unwrap();
-        assert_eq!(d.scope("p", None).unwrap().channels().count(), 0);
+        assert_eq!(d.scope(&provider("p"), None).unwrap().channels().count(), 0);
     }
 
     #[test]
     fn organizations_are_kept_per_provider() {
         let mut d = Directory::new();
-        d.apply("a", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
-        d.apply("b", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
+        d.apply(
+            &provider("a"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
+        d.apply(
+            &provider("b"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
 
         d.apply(
-            "a",
+            &provider("a"),
             DirectoryUpdate::OrganizationRemoved { id: "org".into() },
         )
         .unwrap();
-        assert!(d.organization("a", "org").is_none());
-        assert!(d.organization("b", "org").is_some());
+        assert!(d.organization(&provider("a"), "org").is_none());
+        assert!(d.organization(&provider("b"), "org").is_some());
 
-        d.remove_provider("b");
-        assert_eq!(d.organizations("b").count(), 0);
+        d.remove_provider(&provider("b"));
+        assert_eq!(d.organizations(&provider("b")).count(), 0);
     }
 
     #[test]
@@ -446,7 +492,7 @@ mod tests {
         let mut d = Directory::new();
         assert_eq!(
             d.apply(
-                "p",
+                &provider("p"),
                 DirectoryUpdate::UserUpserted {
                     organization: org(),
                     user: user("ana", "Ana"),
@@ -454,13 +500,16 @@ mod tests {
             ),
             Err(ApplyError::UnknownOrganization("org".into()))
         );
-        assert_eq!(d.organizations("p").count(), 0);
+        assert_eq!(d.organizations(&provider("p")).count(), 0);
 
-        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization()))
-            .unwrap();
+        d.apply(
+            &provider("p"),
+            DirectoryUpdate::OrganizationUpserted(organization()),
+        )
+        .unwrap();
         assert_eq!(
             d.apply(
-                "p",
+                &provider("p"),
                 DirectoryUpdate::ChannelRemoved(ChannelRef::new(Some("org"), "nope")),
             ),
             Err(ApplyError::UnknownChannel("nope".into()))
@@ -472,9 +521,12 @@ mod tests {
         let mut d = Directory::new();
         let mut organization = organization();
         organization.users.push(user("ana", "Ana 2"));
-        d.apply("p", DirectoryUpdate::OrganizationUpserted(organization))
-            .unwrap();
-        let scope = d.scope("p", Some("org")).unwrap();
+        d.apply(
+            &provider("p"),
+            DirectoryUpdate::OrganizationUpserted(organization),
+        )
+        .unwrap();
+        let scope = d.scope(&provider("p"), Some("org")).unwrap();
         assert_eq!(scope.users().count(), 1);
         assert_eq!(scope.user("ana"), Some(&user("ana", "Ana 2")));
     }
