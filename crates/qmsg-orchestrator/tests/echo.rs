@@ -525,6 +525,38 @@ async fn a_killed_provider_frees_its_name_while_no_one_reads() {
 }
 
 #[tokio::test]
+async fn a_replacement_on_another_channel_doesnt_wait() {
+    let port = start_server().await;
+    let (orchestrator, _dir) = orchestrator().await;
+    // The old provider's channel has room for its organization only, and no
+    // one ever reads it, so its `Exited` can't be sent.
+    let (old_tx, old_events) = mpsc::channel(1);
+    let old = orchestrator.spawn(spec(port), old_tx).unwrap();
+    timeout(Duration::from_secs(120), async {
+        while old_events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    old.kill();
+
+    let (new_tx, mut new_events) = mpsc::channel(16);
+    let _new = timeout(Duration::from_secs(30), async {
+        loop {
+            match orchestrator.spawn(spec(port), new_tx.clone()) {
+                Ok(new) => return new,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the name was never freed");
+    started(&mut new_events).await;
+    drop(old_events);
+}
+
+#[tokio::test]
 async fn kill_drops_events_waiting_for_room() {
     let port = start_server().await;
     let (orchestrator, _dir) = orchestrator().await;

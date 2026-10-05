@@ -111,12 +111,14 @@ impl Provider for Echo {
                                     replies.len(),
                                     lines.len()
                                 );
+                                // Answered first, so a full event channel can't
+                                // hold up the failure.
+                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
                                 // The server did answer these, though the
                                 // message they answer was never sent whole.
                                 for reply in replies {
                                     cx.emit(messages.make(&server, None, text(reply)))?;
                                 }
-                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
                                 // Without the server there is nothing left to do.
                                 return Err(error.into());
                             }

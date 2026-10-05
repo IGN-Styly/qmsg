@@ -86,7 +86,8 @@ pub struct ProviderSpec {
 }
 
 /// Something a provider did. `Exited` is always a provider's last event, and
-/// comes before any event of a later provider with the same name.
+/// comes before any event of a later provider with the same name on the same
+/// channel.
 #[derive(Debug)]
 pub enum ProviderEvent {
     Message {
@@ -137,9 +138,9 @@ struct Session {
     started: u64,
     /// Set once `Exited` is sent, or can't be.
     exited: watch::Sender<bool>,
-    /// The `exited` of the previous provider with this name, if it was still
-    /// waiting to send its `Exited` when this one started. None of this
-    /// one's events are sent before that.
+    /// The `exited` of the previous provider with this name on the same
+    /// channel, if it was still waiting to send its `Exited` when this one
+    /// started. None of this one's events are sent before that.
     predecessor: Option<watch::Receiver<bool>>,
 }
 
@@ -336,8 +337,8 @@ impl Orchestrator {
     ///
     /// Failing to load the Wasm is reported as an `Exited` event. Fails if a
     /// provider with the same name is still running; once it stops, its name
-    /// is free even if its `Exited` is still waiting for room. This one's
-    /// events then wait for that `Exited`.
+    /// is free even if its `Exited` is still waiting for room. If it uses the
+    /// same `events`, this one's events then wait for that `Exited`.
     pub fn spawn(
         &self,
         spec: ProviderSpec,
@@ -358,8 +359,12 @@ impl Orchestrator {
         if same_name().any(|s| !s.stopped.load(Ordering::Relaxed)) {
             bail!("a provider named `{}` is already running", spec.name);
         }
-        // A stopped one may still be waiting to send its `Exited`.
+        // A stopped one may still be waiting to send its `Exited`. Only one
+        // on the same channel needs to come first: there is no order between
+        // channels, and this one's events shouldn't wait on a channel no one
+        // reads.
         let predecessor = same_name()
+            .filter(|s| s.events.same_channel(&events))
             .max_by_key(|s| s.started)
             .map(|s| s.exited.subscribe());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
