@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -126,6 +126,9 @@ struct Session {
     /// Open connections, counted from the handshake until every frame the
     /// provider sent has been handled. At most one.
     connections: watch::Sender<usize>,
+    /// Set, under the sessions lock, once the provider has stopped running.
+    /// No connection is accepted after.
+    exiting: AtomicBool,
 }
 
 impl Session {
@@ -155,8 +158,12 @@ impl Session {
 struct ConnectionGuard(Arc<Session>);
 
 impl ConnectionGuard {
-    /// Fails if the provider already has a connection.
+    /// Fails if the provider already has a connection, or has stopped
+    /// running. Called under the sessions lock, which `exiting` is set under.
     fn new(session: Arc<Session>) -> Option<Self> {
+        if session.exiting.load(Ordering::Relaxed) {
+            return None;
+        }
         let first = session.connections.send_if_modified(|n| {
             let first = *n == 0;
             if first {
@@ -164,7 +171,8 @@ impl ConnectionGuard {
             }
             first
         });
-        first.then_some(Self(session))
+        // Only built when counted, since dropping one uncounts it.
+        first.then(|| Self(session))
     }
 }
 
@@ -332,6 +340,7 @@ impl Orchestrator {
             requests: Arc::default(),
             killed: killed.clone(),
             connections: watch::Sender::new(0),
+            exiting: AtomicBool::new(false),
         });
         let handle = ProviderHandle {
             commands: commands_tx,
@@ -362,8 +371,13 @@ impl Orchestrator {
                         result = run(engine, &linker, spec, host_url) => result,
                         _ = killed.wait_for(|&k| k) => Err(anyhow::anyhow!("killed")),
                     };
-                    // Handle what the provider sent before reporting the
-                    // exit, so `Exited` is always its last event.
+                    // Refuse late connections, then handle what the provider
+                    // sent before reporting the exit, so `Exited` is always
+                    // its last event.
+                    {
+                        let _sessions = sessions.lock().unwrap();
+                        session.exiting.store(true, Ordering::Relaxed);
+                    }
                     session.drained().await;
                     // Fail new requests, then the ones still waiting.
                     session.commands.lock().await.close();
@@ -815,8 +829,11 @@ impl Session {
                 // A slow source mustn't keep a killed provider from exiting.
                 let mut killed = self.killed.clone();
                 let result = tokio::select! {
-                    result = blobs::read(&self.blobs, &self.token, &blob, offset, len) => result,
+                    // Checked first, so no read starts once it is set. A read
+                    // already running finishes on its own, after the provider.
+                    biased;
                     _ = killed.wait_for(|&k| k) => Err("killed".into()),
+                    result = blobs::read(&self.blobs, &self.token, &blob, offset, len) => result,
                 };
                 Some(HostMessage::Blob {
                     blob,
@@ -885,4 +902,89 @@ fn not_found() -> ErrorResponse {
     let mut response = ErrorResponse::new(None);
     *response.status_mut() = StatusCode::NOT_FOUND;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> Arc<Session> {
+        let (_commands, commands) = mpsc::unbounded_channel();
+        let (events, _) = mpsc::channel(1);
+        Arc::new(Session {
+            name: "p".into(),
+            commands: tokio::sync::Mutex::new(commands),
+            events,
+            secrets: Weak::new(),
+            blobs: Weak::new(),
+            token: "token".into(),
+            requests: Arc::default(),
+            killed: watch::channel(false).1,
+            connections: watch::Sender::new(0),
+            exiting: AtomicBool::new(false),
+        })
+    }
+
+    /// A handle with no provider behind it, and what it queues.
+    fn handle() -> (ProviderHandle, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (commands, queued) = mpsc::unbounded_channel();
+        let handle = ProviderHandle {
+            commands,
+            requests: Arc::default(),
+            blobs: Weak::new(),
+            token: "token".into(),
+            timeout: None,
+            kill: watch::channel(false).0,
+        };
+        (handle, queued)
+    }
+
+    #[test]
+    fn a_provider_gets_one_connection() {
+        let session = session();
+        let first = ConnectionGuard::new(session.clone()).unwrap();
+        // Refusing doesn't uncount the open connection.
+        for _ in 0..3 {
+            assert!(ConnectionGuard::new(session.clone()).is_none());
+        }
+        assert_eq!(*session.connections.borrow(), 1);
+        drop(first);
+        assert_eq!(*session.connections.borrow(), 0);
+
+        session.exiting.store(true, Ordering::Relaxed);
+        assert!(ConnectionGuard::new(session.clone()).is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_requests_are_forgotten() {
+        let (handle, mut queued) = handle();
+        let read = handle.read_blob("b", 0, 10);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), read)
+                .await
+                .is_err()
+        );
+        assert!(queued.try_recv().is_ok());
+        assert!(handle.requests.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replies_that_dont_fit_are_refused() {
+        let (handle, mut queued) = handle();
+        let answers = [Reply::Blob(vec![0; 11]), Reply::Sent { id: "1".into() }];
+        for answer in answers {
+            let answer_it = async {
+                let bytes = queued.recv().await.unwrap();
+                let HostMessage::Command(Command::ReadBlob { request, .. }) =
+                    qmsg_types::decode(&bytes).unwrap()
+                else {
+                    panic!("expected a blob read");
+                };
+                let tx = handle.requests.pending.lock().unwrap().remove(&request);
+                tx.unwrap().send(Ok(answer)).unwrap();
+            };
+            let (read, ()) = tokio::join!(handle.read_blob("b", 0, 10), answer_it);
+            assert!(matches!(read, Err(RequestError::BadReply(_))), "{read:?}");
+        }
+    }
 }

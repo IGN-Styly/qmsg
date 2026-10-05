@@ -396,8 +396,12 @@ async fn files_over_the_limit_are_refused_by_the_provider() {
     );
 }
 
-/// A blob source whose reads wait until the sender is dropped.
-struct Stall(Mutex<std_mpsc::Receiver<()>>);
+/// A blob source whose reads say they started, then wait until `release`
+/// is dropped.
+struct Stall {
+    started: Mutex<std_mpsc::Sender<()>>,
+    release: Mutex<std_mpsc::Receiver<()>>,
+}
 
 impl BlobSource for Stall {
     fn size(&self) -> u64 {
@@ -405,7 +409,8 @@ impl BlobSource for Stall {
     }
 
     fn read_at(&self, _: u64, _: usize) -> io::Result<Vec<u8>> {
-        let _ = self.0.lock().unwrap().recv();
+        let _ = self.started.lock().unwrap().send(());
+        let _ = self.release.lock().unwrap().recv();
         Ok(vec![0])
     }
 }
@@ -419,24 +424,36 @@ async fn requests_end_on_timeout_or_exit() {
     started(&mut events).await;
 
     // The provider stays stuck reading this, so it answers nothing.
+    let (started_tx, started) = std_mpsc::channel();
     let (release, stalled) = std_mpsc::channel();
-    let blob = provider.add_blob(Stall(Mutex::new(stalled))).unwrap();
+    let blob = provider
+        .add_blob(Stall {
+            started: Mutex::new(started_tx),
+            release: Mutex::new(stalled),
+        })
+        .unwrap();
     let content = vec![Content::File(blob.media(None, None))];
-    provider.set_timeout(Some(Duration::from_millis(200)));
+    provider.set_timeout(Some(Duration::from_secs(2)));
     assert_eq!(
         provider.send_message(home(port), None, content).await,
         Err(RequestError::TimedOut)
     );
+    // It timed out because the read stalled, not for some other reason.
+    started.try_recv().expect("the read never started");
 
-    // A request still waiting when the provider exits fails.
+    // A request still waiting when the provider exits fails. `join!` polls
+    // in order, so the request is queued before the kill.
     provider.set_timeout(None);
-    let (sent, ()) = tokio::join!(
-        provider.send_message(home(port), None, text("ping")),
-        async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            provider.kill();
-        }
-    );
+    let both = async {
+        tokio::join!(
+            provider.send_message(home(port), None, text("ping")),
+            async {
+                tokio::task::yield_now().await;
+                provider.kill();
+            }
+        )
+    };
+    let (sent, ()) = timeout(Duration::from_secs(60), both).await.unwrap();
     assert_eq!(sent, Err(RequestError::NotRunning));
     assert_eq!(exited(&mut events).await, Err("killed".into()));
     drop(release);
@@ -456,7 +473,8 @@ async fn kill_drops_events_waiting_for_room() {
     })
     .await
     .unwrap();
-    // Give the greeting time to start waiting behind it.
+    // Give the greeting time to start waiting behind it. Whether or not it
+    // has, nothing but `Exited` may follow the organization once killed.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     provider.kill();
@@ -480,13 +498,28 @@ async fn opens_channels_with_known_users() {
         .await;
     assert_eq!(opened, Ok(home(port)));
     let opened = provider
-        .open_channel(Some(server), vec!["bob".into()])
+        .open_channel(Some(server.clone()), vec!["bob".into()])
         .await;
     assert_eq!(
         opened,
         Err(RequestError::Failed(CommandError::UnknownUser(
             "bob".into()
         )))
+    );
+    // The server is only a user in its own organization.
+    let opened = provider
+        .open_channel(Some("elsewhere".into()), vec![server.clone()])
+        .await;
+    assert_eq!(
+        opened,
+        Err(RequestError::Failed(CommandError::UnknownOrganization(
+            "elsewhere".into()
+        )))
+    );
+    let opened = provider.open_channel(None, vec![server.clone()]).await;
+    assert_eq!(
+        opened,
+        Err(RequestError::Failed(CommandError::UnknownUser(server)))
     );
 }
 

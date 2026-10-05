@@ -111,12 +111,23 @@ impl Provider for Echo {
                     }
                 }
                 Command::OpenChannel {
-                    request, members, ..
+                    request,
+                    organization,
+                    members,
                 } => {
-                    let result = match members.iter().find(|m| **m != server) {
-                        None if !members.is_empty() => Ok(Reply::Opened(messages.channel.clone())),
-                        Some(member) => Err(CommandError::UnknownUser(member.clone())),
-                        None => Err(CommandError::Failed("no members".into())),
+                    let result = match (organization, members.iter().find(|m| **m != server)) {
+                        // Every user is in the server's organization.
+                        (Some(org), _) if org != server => {
+                            Err(CommandError::UnknownOrganization(org))
+                        }
+                        (None, _) => Err(CommandError::UnknownUser(
+                            members.first().cloned().unwrap_or_default(),
+                        )),
+                        (_, Some(member)) => Err(CommandError::UnknownUser(member.clone())),
+                        (_, None) if members.is_empty() => {
+                            Err(CommandError::Failed("no members".into()))
+                        }
+                        (_, None) => Ok(Reply::Opened(messages.channel.clone())),
                     };
                     cx.reply(request, result)?;
                 }

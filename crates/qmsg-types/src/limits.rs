@@ -207,7 +207,7 @@ pub fn check(
         let (rule, size) = match item {
             Content::Text(text) => {
                 if let Some(rule) = text_rule {
-                    text_length += rule.text_unit.measure(text);
+                    text_length = text_length.saturating_add(rule.text_unit.measure(text));
                 }
                 continue;
             }
@@ -232,9 +232,10 @@ pub fn check(
                 (rule, Some(data.len() as u64))
             }
         };
-        attachments += 1;
+        attachments = attachments.saturating_add(1);
         if let Some(size) = size {
-            total_size += size;
+            // Sizes are only declared, so they can be anything.
+            total_size = total_size.saturating_add(size);
             if let Some(max) = rule.max_size
                 && size > max
             {
@@ -423,6 +424,23 @@ mod tests {
             };
             assert_eq!(result, expected, "{unit:?}");
         }
+    }
+
+    #[test]
+    fn huge_declared_sizes_dont_overflow() {
+        let rules = [ContentRule::new(ContentKind::Image)];
+        let limits = MessageLimits {
+            max_total_size: Some(10),
+            ..MessageLimits::default()
+        };
+        let content = [image(None, u64::MAX), image(None, 1)];
+        assert_eq!(
+            check(&rules, &limits, &content),
+            Err(Violation::TotalTooLarge {
+                size: u64::MAX,
+                max: 10
+            })
+        );
     }
 
     #[test]

@@ -394,6 +394,7 @@ pub enum Reply {
 pub enum CommandError {
     /// The provider or platform can't do this.
     Unsupported,
+    UnknownOrganization(String),
     UnknownChannel(ChannelRef),
     UnknownUser(String),
     UnknownBlob(String),
@@ -414,6 +415,7 @@ impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => write!(f, "not supported"),
+            Self::UnknownOrganization(id) => write!(f, "unknown organization `{id}`"),
             Self::UnknownChannel(channel) => write!(f, "unknown channel {channel:?}"),
             Self::UnknownUser(id) => write!(f, "unknown user `{id}`"),
             Self::UnknownBlob(id) => write!(f, "unknown blob `{id}`"),
