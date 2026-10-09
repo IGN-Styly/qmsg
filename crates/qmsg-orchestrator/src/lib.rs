@@ -345,7 +345,7 @@ impl Orchestrator {
             bail!("a provider named `{}` is already running", spec.name);
         }
         let instance = NEXT_INSTANCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("provider instance ids exhausted"))?;
         let id = ProviderId {
             name: spec.name.clone(),
