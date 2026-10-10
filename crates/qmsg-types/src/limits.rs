@@ -21,7 +21,8 @@ use crate::{Content, ContentKind};
 pub struct ContentRule {
     pub kind: ContentKind,
     /// For text, the longest all of a message's text parts can be together,
-    /// counted in [`ContentRule::text_unit`]s. For anything else, the most
+    /// formatted or not, counted in [`ContentRule::text_unit`]s. Formatted
+    /// text follows the text rule's limit; its own `max_size` is unused. For anything else, the most
     /// bytes in each part.
     pub max_size: Option<u64>,
     /// How text is measured against `max_size`.
@@ -125,6 +126,10 @@ pub enum Violation {
         length: u64,
         max: u64,
     },
+    /// A formatted part has a span outside its text.
+    InvalidFormatting {
+        part: u32,
+    },
     TooLarge {
         part: u32,
         size: u64,
@@ -158,6 +163,9 @@ impl fmt::Display for Violation {
             }
             Self::TextTooLong { length, max } => {
                 write!(f, "the text is {length} long, over the {max} limit")
+            }
+            Self::InvalidFormatting { part } => {
+                write!(f, "part {part}: formatting is outside the text")
             }
             Self::TooLarge { part, size, max } => {
                 write!(f, "part {part} is {size} bytes, over the {max} byte limit")
@@ -208,6 +216,16 @@ pub fn check(
             Content::Text(text) => {
                 if let Some(rule) = text_rule {
                     text_length = text_length.saturating_add(rule.text_unit.measure(text));
+                }
+                continue;
+            }
+            Content::Formatted(formatted) => {
+                if !formatted.is_valid() {
+                    return Err(Violation::InvalidFormatting { part });
+                }
+                if let Some(rule) = text_rule {
+                    text_length =
+                        text_length.saturating_add(rule.text_unit.measure(&formatted.text));
                 }
                 continue;
             }
@@ -424,6 +442,47 @@ mod tests {
             };
             assert_eq!(result, expected, "{unit:?}");
         }
+    }
+
+    #[test]
+    fn formatted_text_counts_toward_the_text_limit() {
+        use crate::{FormattedText, Span, Style};
+        let rules = [
+            ContentRule::new(ContentKind::Text).max_size(5),
+            ContentRule::new(ContentKind::Formatted),
+        ];
+        let limits = MessageLimits::default();
+        let bold = |text: &str, end| {
+            Content::Formatted(FormattedText {
+                text: text.into(),
+                spans: vec![Span {
+                    start: 0,
+                    end,
+                    style: Style::Bold,
+                }],
+            })
+        };
+        assert_eq!(check(&rules, &limits, &[bold("hey", 3)]), Ok(()));
+        assert_eq!(
+            check(
+                &rules,
+                &limits,
+                &[Content::Text("abc".into()), bold("hey", 3)]
+            ),
+            Err(Violation::TextTooLong { length: 6, max: 5 })
+        );
+        assert_eq!(
+            check(&rules, &limits, &[bold("hey", 4)]),
+            Err(Violation::InvalidFormatting { part: 0 })
+        );
+        // Plain text only channels refuse formatting.
+        assert_eq!(
+            check(&rules[..1], &limits, &[bold("hey", 3)]),
+            Err(Violation::Unsupported {
+                part: 0,
+                kind: ContentKind::Formatted
+            })
+        );
     }
 
     #[test]
