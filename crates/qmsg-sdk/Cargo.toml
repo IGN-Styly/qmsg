@@ -7,3 +7,6 @@ edition.workspace = true
 qmsg-types.workspace = true
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 wit-bindgen = "0.62"
+
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
+libc = "0.2"

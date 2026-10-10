@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use qmsg_types::{MAX_READ, Media, MediaSource};
 
+use crate::Blocking;
+
 /// Something a [`Blob`] reads from.
 pub trait BlobSource: Send + Sync + 'static {
     fn size(&self) -> u64;
@@ -150,6 +152,7 @@ impl Drop for Blob {
 /// async threads since sources can block.
 pub(crate) async fn read(
     blobs: &Weak<Blobs>,
+    blocking: &Blocking,
     owner: &str,
     id: &str,
     offset: u64,
@@ -162,9 +165,9 @@ pub(crate) async fn read(
         _ => return Err("unknown blob".into()),
     };
     let len = len.min(MAX_READ) as usize;
-    match tokio::task::spawn_blocking(move || source.read_at(offset, len)).await {
+    match blocking.run(move || source.read_at(offset, len)).await {
         Ok(result) => result.map_err(|e| e.to_string()),
-        Err(_) => Err("reading the blob failed".into()),
+        Err(e) => Err(format!("reading the blob: {e}")),
     }
 }
 
@@ -207,9 +210,12 @@ mod tests {
         let blobs = Arc::new(Blobs::default());
         let _blob = Blob::new(&blobs, "id".into(), "a".into(), vec![1, 2, 3]);
         let weak = Arc::downgrade(&blobs);
-        assert_eq!(read(&weak, "a", "id", 1, 10).await, Ok(vec![2, 3]));
         assert_eq!(
-            read(&weak, "b", "id", 0, 10).await,
+            read(&weak, &Blocking::default(), "a", "id", 1, 10).await,
+            Ok(vec![2, 3])
+        );
+        assert_eq!(
+            read(&weak, &Blocking::default(), "b", "id", 0, 10).await,
             Err("unknown blob".into())
         );
     }
@@ -226,8 +232,16 @@ mod tests {
             }
         }
         let blobs = Arc::new(Blobs::default());
-        let _blob = Blob::new(&blobs, "id".into(), "a".into(), Panics);
-        let result = read(&Arc::downgrade(&blobs), "a", "id", 0, 1).await;
+        let _panics = Blob::new(&blobs, "panics".into(), "a".into(), Panics);
+        let _bytes = Blob::new(&blobs, "bytes".into(), "a".into(), vec![1]);
+        let weak = Arc::downgrade(&blobs);
+        // Its one slot comes back, so the next read runs.
+        let blocking = Blocking::new(1, std::time::Duration::from_secs(5));
+        let result = read(&weak, &blocking, "a", "panics", 0, 1).await;
         assert!(result.is_err());
+        assert_eq!(
+            read(&weak, &blocking, "a", "bytes", 0, 1).await,
+            Ok(vec![1])
+        );
     }
 }

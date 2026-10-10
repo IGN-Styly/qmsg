@@ -1787,6 +1787,7 @@ dependencies = [
 name = "qmsg-sdk"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "qmsg-types",
  "tungstenite",
  "wit-bindgen",

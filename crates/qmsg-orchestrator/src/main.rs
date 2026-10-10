@@ -69,13 +69,17 @@ async fn main() -> anyhow::Result<()> {
                             describe(&message.content),
                         );
                     }
-                    MessageEvent::Edited { channel, id, content } => {
+                    MessageEvent::Edited { channel, id, content, .. } => {
                         tracing::info!(provider = ?provider, channel = channel.channel, id, "edited: {}", describe(&content));
                     }
                     MessageEvent::Deleted { channel, id } => {
                         tracing::info!(provider = ?provider, channel = channel.channel, id, "deleted");
                     }
+                    other => tracing::debug!(provider = ?provider, "{other:?}"),
                 },
+                ProviderEvent::Status { provider, status } => {
+                    tracing::info!(provider = ?provider, "{status:?}");
+                }
                 ProviderEvent::Directory { provider, update } => {
                     if let DirectoryUpdate::OrganizationUpserted(organization) = &update {
                         tracing::info!(
@@ -128,6 +132,7 @@ fn describe(content: &[Content]) -> String {
         .iter()
         .map(|part| match part {
             Content::Text(text) => text.clone(),
+            Content::Formatted(formatted) => formatted.text.clone(),
             Content::Image(_) => "[image]".into(),
             Content::Video(_) => "[video]".into(),
             Content::Audio(_) => "[audio]".into(),
