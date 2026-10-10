@@ -31,10 +31,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use qmsg_sdk::{
     Channel, ChannelKind, ChannelRef, Command, CommandError, Content, ContentKind, ContentRule,
     Context, DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageLimits, Organization,
-    Provider, Reply, Result, User,
+    Provider, Reply, Result, User, Value,
 };
 
 const ME: &str = "me";
+mod functions;
 const MAX_TEXT: u64 = 2000;
 const MAX_FILE: u64 = 16 * 1024 * 1024;
 
@@ -83,6 +84,12 @@ impl Provider for Echo {
 
         while let Some(command) = cx.next_command(None)? {
             match command {
+                command @ (Command::Functions { .. }
+                | Command::Call { .. }
+                | Command::Verify { .. }
+                | Command::Complete { .. }) => {
+                    functions::handle(cx, command, &server, &messages.channel)?;
+                }
                 Command::Send {
                     request,
                     channel: to,
@@ -115,6 +122,7 @@ impl Provider for Echo {
                         match reply {
                             Ok(reply) => replies.push(reply),
                             Err(e) => {
+                                let confirmed = replies.len();
                                 let error = format!(
                                     "the server answered {} of {} lines: {e}",
                                     replies.len(),
@@ -130,7 +138,30 @@ impl Provider for Echo {
                                 // without losing replies. A full event channel delays
                                 // the answer: callers must drain it on another task
                                 // and use request timeouts (not reorder the failure).
-                                cx.reply(request, Err(CommandError::Failed(error.clone())))?;
+                                cx.reply(
+                                    request,
+                                    Err(CommandError::Provider {
+                                        code: "send_incomplete".into(),
+                                        message: error.clone(),
+                                        details: Some(Box::new(Value::Record(
+                                            [
+                                                (
+                                                    "confirmed_lines".into(),
+                                                    Value::Integer(confirmed as i64),
+                                                ),
+                                                (
+                                                    "total_lines".into(),
+                                                    Value::Integer(lines.len() as i64),
+                                                ),
+                                                (
+                                                    "last_line_delivery_unknown".into(),
+                                                    Value::Boolean(true),
+                                                ),
+                                            ]
+                                            .into(),
+                                        ))),
+                                    }),
+                                )?;
                                 // Without the server there is nothing left to do.
                                 return Err(error.into());
                             }

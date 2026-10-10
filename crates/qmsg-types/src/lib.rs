@@ -5,8 +5,8 @@
 //!
 //! These are encoded with postcard, which is not self-describing, so both
 //! sides must agree on the exact layout. A provider only loads when its
-//! [`ABI_VERSION`] matches the orchestrator's exactly, so any change to these
-//! types, including a new enum variant, needs a bump.
+//! [`ABI_VERSION`] matches the orchestrator's exactly. During development we
+//! rebuild both sides together without bumping the version for each change.
 //!
 //! # Addressing
 //!
@@ -27,7 +27,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+mod functions;
 mod limits;
+
+pub use functions::*;
 
 pub use limits::{ContentRule, MessageLimits, TextUnit, Violation, check};
 
@@ -342,6 +345,26 @@ pub enum DirectoryUpdate {
 /// orchestrator chooses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    /// Lists the functions currently available in this context.
+    Functions {
+        request: u64,
+        context: FunctionContext,
+    },
+    /// Runs an action or lookup, answered with `Reply::Value`.
+    Call {
+        request: u64,
+        call: FunctionCall,
+    },
+    /// Checks an input without carrying out an action.
+    Verify {
+        request: u64,
+        verification: Box<VerificationRequest>,
+    },
+    /// Suggests values without carrying out an action.
+    Complete {
+        request: u64,
+        completion: Box<CompletionRequest>,
+    },
     /// Sends a message, answered with [`Reply::Sent`]. The provider also
     /// reports the message as [`MessageEvent::Received`], like any other.
     Send {
@@ -382,6 +405,10 @@ pub enum Command {
 /// A provider's answer to a [`Command`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
+    Functions(Vec<Function>),
+    Value(Value),
+    Verified(Verification),
+    Completed(CompletionPage),
     /// The id of the message that was sent.
     Sent {
         id: String,
@@ -395,6 +422,16 @@ pub enum Reply {
 pub enum CommandError {
     /// The provider or platform can't do this.
     Unsupported,
+    UnknownFunction(String),
+    /// Invalid function arguments, with codes and messages for each input.
+    InvalidInput(Vec<InputIssue>),
+    /// A platform-specific failure with a stable code and optional data,
+    /// such as confirmed progress after a partial failure.
+    Provider {
+        code: String,
+        message: String,
+        details: Option<Box<Value>>,
+    },
     UnknownOrganization(String),
     UnknownChannel(ChannelRef),
     UnknownUser(String),
@@ -416,6 +453,20 @@ impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => write!(f, "not supported"),
+            Self::UnknownFunction(id) => write!(f, "unknown function `{id}`"),
+            Self::Provider { code, message, .. } => write!(f, "{code}: {message}"),
+            Self::InvalidInput(issues) => {
+                write!(f, "invalid input")?;
+                for issue in issues {
+                    write!(
+                        f,
+                        "; {}: {}",
+                        issue.input.as_deref().unwrap_or("inputs"),
+                        issue.message
+                    )?;
+                }
+                Ok(())
+            }
             Self::UnknownOrganization(id) => write!(f, "unknown organization `{id}`"),
             Self::UnknownChannel(channel) => write!(f, "unknown channel {channel:?}"),
             Self::UnknownUser(id) => write!(f, "unknown user `{id}`"),

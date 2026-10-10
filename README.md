@@ -20,9 +20,10 @@ provider owns its network connections and has full TCP and UDP access.
 Each provider runs on its own thread and talks to the orchestrator over a
 WebSocket on localhost, sending postcard-encoded `qmsg-types` messages.
 `wit/qmsg.wit` only exports the entry point and should not need to change.
-Change the types instead. Any change to them, including a new enum variant,
-needs an `ABI_VERSION` bump: postcard can't decode a layout it doesn't know,
-and a provider only loads when its version matches the orchestrator's. Each
+Change the types instead. While qmsg is in development, rebuild the host and
+providers together after changing the types; we keep `ABI_VERSION` unchanged.
+Postcard can't decode a layout it doesn't know, and a provider only loads when
+its version matches the orchestrator's. Each
 side refuses to send a message over 64 MiB rather than drop the connection.
 
 Providers report the organizations they are part of, such as Discord servers
@@ -57,6 +58,98 @@ wait for channel space. A replacement never waits for that exit to be read.
 Secrets stay keyed by name so the replacement can use them. `kill()` and
 handle drop stop the provider and discard events still waiting for room.
 Already queued events remain, and `Exited` follows when there is room.
+
+### Functions and input helpers
+
+Providers answer `Command::Functions` with `Reply::Functions` to declare the
+functions available in a context: the whole provider, an organization, a
+channel, or one message. `ProviderHandle::functions` reads this list. Include
+all verification and completion functions referenced by inputs in that list.
+Ids are unique within the provider. Fetch the list again when context or
+permissions change; discovery is a snapshot, not permission to run an action.
+
+A `Function` has an id, display label, description, kind, and named inputs.
+Inputs declare their type, whether they are required, and optional ids of
+verification and completion functions. `Function::check` checks required,
+unknown, and wrongly typed inputs locally. Providers must check again when
+called, including permissions, platform limits, and whether ids still exist.
+Verification is a preview of validity; it does not replace checks on execution.
+
+`FunctionKind::Action` declares the action and its result type. `ActionKind`
+includes send, edit, delete, open channel, and custom actions. For example,
+a provider can offer these functions for a message it owns:
+
+```rust
+use qmsg_types::*;
+
+let edit = Function {
+    id: "edit".into(), label: "Edit message".into(),
+    description: "Replace this message's content".into(),
+    kind: FunctionKind::Action {
+        action: ActionKind::EditMessage, result: ValueType::Null,
+    },
+    inputs: vec![FunctionInput {
+        id: "content".into(), label: "Content".into(),
+        description: "New message content".into(),
+        value_type: ValueType::Content, required: true,
+        verification: Some("verify-content".into()), completion: None,
+    }],
+};
+let delete = Function {
+    id: "delete".into(), label: "Delete message".into(),
+    description: "Delete this message".into(),
+    kind: FunctionKind::Action {
+        action: ActionKind::DeleteMessage, result: ValueType::Null,
+    },
+    inputs: vec![],
+};
+```
+
+Use `FunctionKind::Lookup(result_type)` for general queries outside actions,
+such as finding users. `ProviderHandle::call_function` sends `Command::Call`
+with the function id, context, and an argument map. The provider answers with
+`Reply::Value`. Values support text, booleans, integers, lists, records, bytes,
+channels, messages and message content (including blobs). `Value::Null` is an
+explicit result for actions with no return value. `ValueType::Record` describes
+the outer type; the provider describes and checks its fields. Custom actions
+and records need no new protocol variants.
+
+`ProviderHandle::verify` sends `Command::Verify` to a function declared as
+`FunctionKind::Verification`. Its `VerificationRequest` carries the helper's
+function id, context, other input values, the value to check, and an optional
+`FunctionInputRef` identifying the parent function and input. The provider
+answers with `Reply::Verified(Verification::Valid)` or `Verification::Invalid`
+with one or more input issues. Each issue has an input id (or `None` for the
+whole form), a stable code, and a message to display.
+
+`ProviderHandle::complete` sends `Command::Complete` to a function declared as
+`FunctionKind::Completion`. `CompletionRequest` carries the same context and
+input reference, plus query text, a page limit, and an optional opaque cursor.
+The provider answers with `Reply::Completed`: items have a display label,
+optional description, and the typed value to use as input. An empty page means
+no matches. Pages must respect the limit. Pass `next_cursor` with the same
+context, arguments, input and query to get another page.
+
+Both helpers accept partial input sets while a user types. `call.arguments`
+holds the other inputs of the parent function when `input` is present, or the
+helper's own named inputs for a standalone request. Set `input` to `None` to
+use helpers independently of actions. Lookups, verification and completion
+must not perform actions or change platform state.
+
+Request failure differs from invalid input or no matches. Providers return
+`CommandError::InvalidInput`, `UnknownFunction`, `Forbidden`, `RateLimited`, or
+another existing error. `CommandError::Provider` adds a stable platform error
+code, display message, and optional typed details, such as partial progress.
+Calls use the same timeouts, event-before-answer order, and delivery rules as
+existing commands. Edit/delete handlers emit the corresponding message event
+before answering. The declarations above describe how providers can expose
+those actions; echo's TCP server does not support them.
+
+Echo demonstrates a `users` lookup, an `open-channel` action, `verify-user`,
+and paged `complete-user`. The helpers work both on the `user` input and as
+standalone requests. Incomplete sends now return the `send_incomplete` error
+code with `confirmed_lines`, `total_lines`, and `last_line_delivery_unknown`
+details, so clients do not have to parse a sentence to find out what happened.
 
 Messages have an id, a timestamp and an optional message they reply to. Their
 content is a list of parts, so one message can carry text, images, video,

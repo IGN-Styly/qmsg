@@ -32,8 +32,10 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use futures_util::{SinkExt, StreamExt};
 use qmsg_types::{
-    ABI_VERSION, ChannelRef, Command, CommandError, Content, DirectoryUpdate, HostMessage,
-    LogLevel, MAX_FRAME, MAX_ID, MAX_READ, MessageEvent, ProviderConfig, ProviderMessage, Reply,
+    ABI_VERSION, ChannelRef, Command, CommandError, CompletionPage, CompletionRequest, Content,
+    DirectoryUpdate, Function, FunctionCall, FunctionContext, HostMessage, LogLevel, MAX_FRAME,
+    MAX_ID, MAX_READ, MessageEvent, ProviderConfig, ProviderMessage, Reply, Value, Verification,
+    VerificationRequest,
 };
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
@@ -475,6 +477,75 @@ impl ProviderHandle {
         self.timeout = timeout;
     }
 
+    /// Discovers the functions available now in a context, including helpers
+    /// linked from inputs. An empty list means none are available.
+    pub async fn functions(&self, context: FunctionContext) -> Result<Vec<Function>, RequestError> {
+        match self
+            .request(|request| Command::Functions { request, context })
+            .await?
+        {
+            Reply::Functions(functions) => Ok(functions),
+            other => Err(bad_reply(other)),
+        }
+    }
+
+    /// Calls a declared action or lookup. Use `Function::check` first for
+    /// local input checks. Providers must recheck inputs and permissions.
+    /// Emit required events before answering, as with `send_message`.
+    pub async fn call_function(&self, call: FunctionCall) -> Result<Value, RequestError> {
+        match self
+            .request(|request| Command::Call { request, call })
+            .await?
+        {
+            Reply::Value(value) => Ok(value),
+            other => Err(bad_reply(other)),
+        }
+    }
+
+    /// Runs a verification function, either linked to an input or standalone.
+    /// An invalid value is a successful `Verification::Invalid` result, while
+    /// failure to check it is a request error. Checking does not run an action.
+    pub async fn verify(
+        &self,
+        verification: VerificationRequest,
+    ) -> Result<Verification, RequestError> {
+        match self
+            .request(|request| Command::Verify {
+                request,
+                verification: Box::new(verification),
+            })
+            .await?
+        {
+            Reply::Verified(Verification::Invalid(issues)) if issues.is_empty() => Err(
+                RequestError::BadReply("invalid verification has no issues".into()),
+            ),
+            Reply::Verified(result) => Ok(result),
+            other => Err(bad_reply(other)),
+        }
+    }
+
+    /// Runs an autocomplete function. Labels are for display; use the item's
+    /// value as the input. This also works outside actions. No action runs.
+    pub async fn complete(
+        &self,
+        completion: CompletionRequest,
+    ) -> Result<CompletionPage, RequestError> {
+        let limit = completion.limit;
+        match self
+            .request(|request| Command::Complete {
+                request,
+                completion: Box::new(completion),
+            })
+            .await?
+        {
+            Reply::Completed(page) if page.items.len() as u64 <= u64::from(limit) => Ok(page),
+            Reply::Completed(_) => Err(RequestError::BadReply(
+                "completion exceeds requested limit".into(),
+            )),
+            other => Err(bad_reply(other)),
+        }
+    }
+
     /// Offers `source` to this provider, to send as a [`Blob::media`]. It can
     /// read it until the returned [`Blob`] is dropped.
     ///
@@ -686,6 +757,10 @@ fn wasi_ctx() -> WasiCtx {
 
 fn bad_reply(reply: Reply) -> RequestError {
     let kind = match reply {
+        Reply::Functions(_) => "Functions",
+        Reply::Value(_) => "Value",
+        Reply::Verified(_) => "Verified",
+        Reply::Completed(_) => "Completed",
         Reply::Sent { .. } => "Sent",
         Reply::Opened(_) => "Opened",
         Reply::Blob(_) => "Blob",
@@ -1106,6 +1181,115 @@ mod tests {
             };
             let (read, ()) = tokio::join!(handle.read_blob("b", 0, 10), answer_it);
             assert!(matches!(read, Err(RequestError::BadReply(_))), "{read:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_function_replies_are_refused() {
+        let (handle, mut queued) = handle();
+        let call = FunctionCall {
+            function: "helper".into(),
+            context: FunctionContext::Provider,
+            arguments: Default::default(),
+        };
+        let cases = [
+            (0, Reply::Value(Value::Null)),
+            (1, Reply::Functions(vec![])),
+            (2, Reply::Verified(Verification::Invalid(vec![]))),
+            (2, Reply::Value(Value::Null)),
+            (
+                3,
+                Reply::Completed(CompletionPage {
+                    items: vec![qmsg_types::CompletionItem {
+                        label: "too many".into(),
+                        description: None,
+                        value: Value::Null,
+                    }],
+                    next_cursor: None,
+                }),
+            ),
+            (3, Reply::Value(Value::Null)),
+        ];
+        for (method, reply) in cases {
+            let run = async {
+                match method {
+                    0 => handle.functions(call.context.clone()).await.map(|_| ()),
+                    1 => handle.call_function(call.clone()).await.map(|_| ()),
+                    2 => handle
+                        .verify(VerificationRequest {
+                            call: call.clone(),
+                            input: None,
+                            value: Value::Text("input".into()),
+                        })
+                        .await
+                        .map(|_| ()),
+                    _ => handle
+                        .complete(CompletionRequest {
+                            call: call.clone(),
+                            input: None,
+                            query: "q".into(),
+                            cursor: None,
+                            limit: 0,
+                        })
+                        .await
+                        .map(|_| ()),
+                }
+            };
+            let answer = async {
+                let bytes = queued.recv().await.unwrap();
+                let HostMessage::Command(command) = qmsg_types::decode(&bytes).unwrap() else {
+                    panic!("expected command");
+                };
+                let request = match command {
+                    Command::Functions { request, context } => {
+                        assert_eq!(method, 0);
+                        assert_eq!(context, call.context);
+                        request
+                    }
+                    Command::Call {
+                        request,
+                        call: sent,
+                    } => {
+                        assert_eq!(method, 1);
+                        assert_eq!(sent, call);
+                        request
+                    }
+                    Command::Verify {
+                        request,
+                        verification,
+                    } => {
+                        assert_eq!(method, 2);
+                        assert_eq!(verification.call, call);
+                        assert_eq!(verification.value, Value::Text("input".into()));
+                        request
+                    }
+                    Command::Complete {
+                        request,
+                        completion,
+                    } => {
+                        assert_eq!(method, 3);
+                        assert_eq!(completion.call, call);
+                        assert_eq!(completion.query, "q");
+                        assert_eq!(completion.limit, 0);
+                        request
+                    }
+                    _ => panic!("expected function command"),
+                };
+                handle
+                    .requests
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .remove(&request)
+                    .unwrap()
+                    .send(Ok(reply))
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(run, answer);
+            assert!(
+                matches!(result, Err(RequestError::BadReply(_))),
+                "{result:?}"
+            );
         }
     }
 }

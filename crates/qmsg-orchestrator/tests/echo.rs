@@ -10,8 +10,10 @@ use qmsg_orchestrator::{
     BlobSource, Directory, Encryption, Orchestrator, ProviderEvent, ProviderSpec, RequestError,
 };
 use qmsg_types::{
-    ChannelKind, ChannelRef, CommandError, Content, ContentKind, DirectoryUpdate, MAX_FRAME,
-    MAX_READ, Media, MediaSource, Message, MessageEvent, Violation,
+    ActionKind, ChannelKind, ChannelRef, CommandError, CompletionRequest, Content, ContentKind,
+    DirectoryUpdate, FunctionCall, FunctionContext, FunctionInputRef, FunctionKind, MAX_FRAME,
+    MAX_READ, Media, MediaSource, Message, MessageEvent, Value, Verification, VerificationRequest,
+    Violation,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -147,6 +149,149 @@ fn file(name: &str, source: MediaSource) -> Content {
 }
 
 #[tokio::test]
+async fn functions_offer_actions_lookups_verification_and_completion() {
+    let port = start_server().await;
+    let server = format!("127.0.0.1:{port}");
+    let (orchestrator, _dir) = orchestrator().await;
+    let (events_tx, mut events) = mpsc::channel(16);
+    let provider = orchestrator.spawn(spec(port), events_tx).unwrap();
+    started(&mut events).await;
+    let functions = provider.functions(FunctionContext::Provider).await.unwrap();
+    let users = functions.iter().find(|f| f.id == "users").unwrap();
+    assert_eq!(users.inputs[0].verification.as_deref(), Some("verify-user"));
+    assert_eq!(users.inputs[0].completion.as_deref(), Some("complete-user"));
+    let open = functions.iter().find(|f| f.id == "open-channel").unwrap();
+    assert!(matches!(
+        open.kind,
+        FunctionKind::Action {
+            action: ActionKind::OpenChannel,
+            ..
+        }
+    ));
+    let call = |function: &str| FunctionCall {
+        function: function.into(),
+        context: FunctionContext::Channel(home(port)),
+        arguments: Default::default(),
+    };
+    let Value::List(found) = provider.call_function(call("users")).await.unwrap() else {
+        panic!("expected users");
+    };
+    assert_eq!(found.len(), 2);
+    // Providers check inputs even when the client skips local checks.
+    assert!(matches!(provider.call_function(call("open-channel")).await,
+        Err(RequestError::Failed(CommandError::InvalidInput(issues))) if issues[0].code == "required"));
+    let mut open_call = call("open-channel");
+    open_call
+        .arguments
+        .insert("user".into(), Value::Text(server.clone()));
+    assert_eq!(
+        provider.call_function(open_call).await.unwrap(),
+        Value::Channel(home(port))
+    );
+    let mut wrong = call("users");
+    wrong.arguments.insert("user".into(), Value::Boolean(true));
+    assert!(matches!(provider.call_function(wrong).await,
+        Err(RequestError::Failed(CommandError::InvalidInput(issues))) if issues[0].code == "wrong_type"));
+    let input = FunctionInputRef {
+        function: "users".into(),
+        input: "user".into(),
+    };
+    for (value, valid) in [
+        (Value::Text(server.clone()), true),
+        (Value::Text("missing".into()), false),
+    ] {
+        let result = provider
+            .verify(VerificationRequest {
+                call: call("verify-user"),
+                input: Some(input.clone()),
+                value,
+            })
+            .await
+            .unwrap();
+        if valid {
+            assert_eq!(result, Verification::Valid);
+        } else {
+            assert!(matches!(result, Verification::Invalid(issues)
+            if issues[0].input.as_deref() == Some("user") && issues[0].code == "unknown_user"));
+        }
+    }
+    // Helpers also work independently of actions or declared inputs.
+    assert_eq!(
+        provider
+            .verify(VerificationRequest {
+                call: call("verify-user"),
+                input: None,
+                value: Value::Text("me".into()),
+            })
+            .await
+            .unwrap(),
+        Verification::Valid
+    );
+    let mut completion = CompletionRequest {
+        call: call("complete-user"),
+        input: Some(input),
+        query: String::new(),
+        cursor: None,
+        limit: 1,
+    };
+    let first = provider.complete(completion.clone()).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].value, Value::Text(server.clone()));
+    completion.cursor = first.next_cursor;
+    assert!(completion.cursor.is_some());
+    let second = provider.complete(completion.clone()).await.unwrap();
+    assert_eq!(second.items[0].label, "qmsg");
+    assert_eq!(second.items[0].value, Value::Text("me".into()));
+    assert!(second.next_cursor.is_none());
+    completion.input = None;
+    completion.cursor = None;
+    completion.query = "q".into();
+    assert_eq!(
+        provider.complete(completion.clone()).await.unwrap().items,
+        second.items
+    );
+    completion.query = "no-match".into();
+    let empty = provider.complete(completion.clone()).await.unwrap();
+    assert!(empty.items.is_empty() && empty.next_cursor.is_none());
+    completion.cursor = Some("bad".into());
+    assert!(matches!(provider.complete(completion).await,
+        Err(RequestError::Failed(CommandError::InvalidInput(issues))) if issues[0].code == "bad_cursor"));
+    // A shared helper can adapt to the parent action using the input reference.
+    let action_input = FunctionInputRef {
+        function: "open-channel".into(),
+        input: "user".into(),
+    };
+    assert!(matches!(provider.verify(VerificationRequest {
+        call: call("verify-user"), input: Some(action_input.clone()), value: Value::Text("me".into()),
+    }).await.unwrap(), Verification::Invalid(issues) if issues[0].code == "no_conversation"));
+    let action_items = provider
+        .complete(CompletionRequest {
+            call: call("complete-user"),
+            input: Some(action_input),
+            query: String::new(),
+            cursor: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(action_items.items.len(), 1);
+    assert_eq!(action_items.items[0].value, Value::Text(server));
+    assert!(matches!(provider.call_function(call("missing")).await,
+        Err(RequestError::Failed(CommandError::UnknownFunction(id))) if id == "missing"));
+    assert!(
+        matches!(provider.functions(FunctionContext::Organization("missing".into())).await,
+        Err(RequestError::Failed(CommandError::UnknownOrganization(id))) if id == "missing")
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "lookups and input helpers must not emit message events"
+    );
+    provider.shutdown().unwrap();
+    received(&mut events).await;
+    assert!(exited(&mut events).await.is_ok());
+}
+
+#[tokio::test]
 async fn provider_reports_its_organization() {
     let port = start_server().await;
     let server = format!("127.0.0.1:{port}");
@@ -245,9 +390,26 @@ async fn a_send_the_server_drops_fails() {
     started(&mut events).await;
 
     let sent = provider.send_message(home(port), None, text("a\nb")).await;
-    let Err(RequestError::Failed(CommandError::Failed(error))) = sent else {
+    let Err(RequestError::Failed(CommandError::Provider {
+        code,
+        message: error,
+        details,
+    })) = sent
+    else {
         panic!("expected the send to fail, got {sent:?}");
     };
+    assert_eq!(code, "send_incomplete");
+    assert_eq!(
+        details.as_deref(),
+        Some(&Value::Record(
+            [
+                ("confirmed_lines".into(), Value::Integer(1)),
+                ("total_lines".into(), Value::Integer(2)),
+                ("last_line_delivery_unknown".into(), Value::Boolean(true)),
+            ]
+            .into()
+        ))
+    );
     assert!(error.contains("1 of 2 lines"), "{error}");
     // The server's answer still arrives, but the message isn't reported as
     // sent.
@@ -274,9 +436,26 @@ async fn partial_replies_are_queued_before_failure_even_when_events_fill() {
     );
     assert_eq!(received(&mut events).await.content, text("echo: a"));
     let result = timeout(Duration::from_secs(30), &mut sent).await.unwrap();
-    let Err(RequestError::Failed(CommandError::Failed(error))) = result else {
+    let Err(RequestError::Failed(CommandError::Provider {
+        code,
+        message: error,
+        details,
+    })) = result
+    else {
         panic!("expected partial failure, got {result:?}");
     };
+    assert_eq!(code, "send_incomplete");
+    assert_eq!(
+        details.as_deref(),
+        Some(&Value::Record(
+            [
+                ("confirmed_lines".into(), Value::Integer(2)),
+                ("total_lines".into(), Value::Integer(3)),
+                ("last_line_delivery_unknown".into(), Value::Boolean(true)),
+            ]
+            .into()
+        ))
+    );
     assert!(error.contains("2 of 3 lines"), "{error}");
     provider.kill();
     // A kill after the answer cannot discard the already queued reply.

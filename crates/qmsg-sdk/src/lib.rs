@@ -24,9 +24,12 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 pub use qmsg_types::{
-    self as types, Channel, ChannelKind, ChannelRef, Command, CommandError, Content, ContentKind,
-    ContentRule, DirectoryUpdate, LogLevel, Media, MediaSource, Message, MessageEvent,
-    MessageLimits, Organization, ProviderConfig, Reply, TextUnit, User, Violation,
+    self as types, ActionKind, Arguments, Channel, ChannelKind, ChannelRef, Command, CommandError,
+    CompletionItem, CompletionPage, CompletionRequest, Content, ContentKind, ContentRule,
+    DirectoryUpdate, Function, FunctionCall, FunctionContext, FunctionInput, FunctionInputRef,
+    FunctionKind, InputIssue, LogLevel, Media, MediaSource, Message, MessageEvent, MessageLimits,
+    Organization, ProviderConfig, Reply, TextUnit, User, Value, ValueType, Verification,
+    VerificationRequest, Violation,
 };
 use qmsg_types::{HostMessage, ProviderMessage};
 use tungstenite::WebSocket;
